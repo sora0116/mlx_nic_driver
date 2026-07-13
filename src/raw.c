@@ -1,5 +1,5 @@
 #include "raw.h"
-#include "mlx5.h"
+#include "sample.h"
 
 #include <stdio.h>
 
@@ -23,5 +23,5 @@ int raw_loop_run(const struct raw_loop_opts *opts) {
         return -1;
     }
 
-    return mlx5_raw_loop(opts);
+    return sample_raw_loop(opts);
 }

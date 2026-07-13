@@ -1,6 +1,7 @@
 #include "pci.h"
 #include "mlx5.h"
 #include "raw.h"
+#include "sample.h"
 #include "vfio.h"
 
 #include <stdio.h>
@@ -177,7 +178,7 @@ int main(int argc, char **argv) {
             usage(stderr, argv[0]);
             return 2;
         }
-        return mlx5_seq_basic(argv[2]) == 0 ? 0 : 1;
+        return sample_mlx5_seq_basic(argv[2]) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "mlx5-tx-test") == 0) {
@@ -204,7 +205,7 @@ int main(int argc, char **argv) {
         opts.src_mac = opt_value(argc, argv, "--src");
         opts.ethertype = opt_value(argc, argv, "--ethertype");
         opts.payload_hex = opt_value(argc, argv, "--payload-hex");
-        return mlx5_tx_test_opts(argv[2], &opts) == 0 ? 0 : 1;
+        return sample_mlx5_tx_test_opts(argv[2], &opts) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "mlx5-query-hca-cap") == 0) {
@@ -220,7 +221,7 @@ int main(int argc, char **argv) {
             usage(stderr, argv[0]);
             return 2;
         }
-        return mlx5_rx_objects(argv[2]) == 0 ? 0 : 1;
+        return sample_mlx5_rx_objects(argv[2]) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "mlx5-rx-post-test") == 0) {
@@ -228,7 +229,7 @@ int main(int argc, char **argv) {
             usage(stderr, argv[0]);
             return 2;
         }
-        return mlx5_rx_post_test(argv[2]) == 0 ? 0 : 1;
+        return sample_mlx5_rx_post_test(argv[2]) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "mlx5-rx-steer-test") == 0) {
@@ -236,7 +237,7 @@ int main(int argc, char **argv) {
             usage(stderr, argv[0]);
             return 2;
         }
-        return mlx5_rx_steer_test(argv[2]) == 0 ? 0 : 1;
+        return sample_mlx5_rx_steer_test(argv[2]) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "mlx5-rx-wait-test") == 0) {
@@ -244,7 +245,7 @@ int main(int argc, char **argv) {
             usage(stderr, argv[0]);
             return 2;
         }
-        return mlx5_rx_wait_test(argv[2]) == 0 ? 0 : 1;
+        return sample_mlx5_rx_wait_test(argv[2]) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "raw-loop") == 0) {

@@ -1,3 +1,5 @@
-mlxnicd
-*.o
-.mlxnicd-state/
+/mlxnicd
+/libmlxnicd.a
+/src/*.o
+/examples/api_loop_minimal
+/examples/*.o

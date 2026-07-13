@@ -1,27 +1,42 @@
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g
-CPPFLAGS ?= -D_DEFAULT_SOURCE
+CPPFLAGS ?= -D_DEFAULT_SOURCE -Iinclude
 LDFLAGS ?=
+AR ?= ar
 
 TARGET := mlxnicd
-SRC := src/main.c src/pci.c src/vfio.c src/raw.c src/mlx5.c
-OBJ := $(SRC:.c=.o)
+LIB := libmlxnicd.a
+EXAMPLE_API := examples/api_loop_minimal
+LIB_SRC := src/pci.c src/vfio.c src/mlx5.c
+LIB_OBJ := $(LIB_SRC:.c=.o)
+APP_SRC := src/main.c src/raw.c src/sample.c
+APP_OBJ := $(APP_SRC:.c=.o)
+EXAMPLE_SRC := examples/api_loop_minimal.c
+EXAMPLE_OBJ := $(EXAMPLE_SRC:.c=.o)
 
 REMOTE_HOST ?= sdn-svr6
 REMOTE_DIR ?= ~/work/takagi/nicd
 
-.PHONY: all clean sync remote-run remote-probe remote-vfio-check remote-vfio-probe remote-raw-loop-preflight
+.PHONY: all clean sync remote-run remote-probe remote-vfio-check remote-vfio-probe remote-raw-loop-preflight examples
 
 all: $(TARGET)
 
-$(TARGET): $(OBJ)
-	$(CC) $(LDFLAGS) -o $@ $^
+examples: $(EXAMPLE_API)
 
-%.o: %.c src/pci.h src/vfio.h src/vfio_compat.h src/raw.h src/mlx5.h
+$(TARGET): $(APP_OBJ) $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $(APP_OBJ) -L. -lmlxnicd
+
+$(EXAMPLE_API): $(EXAMPLE_OBJ) $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $(EXAMPLE_OBJ) -L. -lmlxnicd
+
+$(LIB): $(LIB_OBJ)
+	$(AR) rcs $@ $^
+
+%.o: %.c src/pci.h src/vfio.h src/vfio_compat.h src/raw.h src/mlx5.h include/mlxnicd.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(TARGET) $(OBJ)
+	rm -f $(TARGET) $(LIB) $(APP_OBJ) $(LIB_OBJ) $(EXAMPLE_OBJ) $(EXAMPLE_API)
 
 sync:
 	REMOTE_HOST='$(REMOTE_HOST)' REMOTE_DIR='$(REMOTE_DIR)' scripts/sync.sh

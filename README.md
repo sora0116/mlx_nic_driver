@@ -13,6 +13,19 @@ raw Ethernet frame の送受信を確認することを目的にしています�
 - `raw-loop` で `sdn-svr6 -> NIC -> wire -> sdn-svr5 -> wire -> NIC -> sdn-svr6`
   の end-to-end を確認できる
 
+現在の実装は次の 2 層に分けています。
+
+- library
+  - `include/mlxnicd.h`
+  - `libmlxnicd.a`
+  - DPDK を参考にした `open -> configure -> start -> tx_burst/rx_burst -> stop/close`
+    の API を提供
+- sample application
+  - `src/sample.c`
+  - 既存の `mlx5-tx-test`, `mlx5-rx-wait-test`, `raw-loop` などの挙動を
+    サンプルとして実装
+  - `src/main.c` の CLI は sample 層を呼ぶ
+
 ## 現在の構成
 
 開発対象:
@@ -36,13 +49,79 @@ raw Ethernet frame の送受信を確認することを目的にしています�
 make
 ```
 
+生成物:
+
+- `libmlxnicd.a`
+- `mlxnicd`
+- `examples/api_loop_minimal` (`make examples`)
+
+アプリケーションに組み込む場合は `include/mlxnicd.h` を include し、
+`libmlxnicd.a` をリンクする想定です。
+
+## ライブラリAPI
+
+公開ヘッダ:
+
+- [include/mlxnicd.h](/home/sora/work/mlxnicd/include/mlxnicd.h)
+
+最小 API:
+
+- `mlxnicd_dev_open()`
+- `mlxnicd_dev_config_init()`
+- `mlxnicd_dev_configure()`
+- `mlxnicd_dev_start()`
+- `mlxnicd_tx_burst()`
+- `mlxnicd_rx_burst()`
+- `mlxnicd_rx_release()`
+- `mlxnicd_dev_stop()`
+- `mlxnicd_dev_close()`
+- `mlxnicd_frame_build()`
+
+想定する基本フロー:
+
+```c
+struct mlxnicd_dev *dev = NULL;
+struct mlxnicd_dev_config cfg;
+
+mlxnicd_dev_config_init(&cfg);
+cfg.flags = MLXNICD_DEV_F_TX | MLXNICD_DEV_F_RX;
+
+mlxnicd_dev_open(&dev, "0000:01:00.0");
+mlxnicd_dev_configure(dev, &cfg);
+mlxnicd_dev_start(dev);
+
+/* mlxnicd_tx_burst() / mlxnicd_rx_burst() */
+
+mlxnicd_dev_stop(dev);
+mlxnicd_dev_close(dev);
+```
+
+実ファイルの最小例:
+
+- [examples/api_loop_minimal.c](/home/sora/work/mlxnicd/examples/api_loop_minimal.c)
+
+ビルド:
+
+```sh
+make examples
+```
+
+注意:
+
+- `mlxnicd_rx_burst()` が返す `pkt.data` は driver 管理バッファを指します
+- 読み終わったら `mlxnicd_rx_release()` を呼んで RX バッファを返す必要があります
+- 今の API は single device / single queue の最小形です
+
 リモート同期:
 
 ```sh
 make sync
 ```
 
-## CLI
+## CLI / sample application
+
+`mlxnicd` バイナリは、library を使う sample application 集合としても使います。
+特に `mlx5-*-test` と `raw-loop` は sample 層から呼ばれます。
 
 現在の主要コマンド:
 
@@ -150,16 +229,35 @@ ssh sdn-svr6 'cd ~/work/takagi/nicd && \
     --verbose'
 ```
 
+### library example の最小確認
+
+`examples/api_loop_minimal` は library API を直接使う最小例です。
+
+```sh
+ssh sdn-svr6 'cd ~/work/takagi/nicd && make examples && sudo ./examples/api_loop_minimal'
+```
+
+確認済み出力:
+
+```text
+received one packet: len=60
+```
+
 ## ソースファイルの役割
 
 - `src/main.c`
   - CLI 解析
   - サブコマンドごとの引数検証
-  - 各 backend 関数の呼び出し
+  - sample 層の呼び出し
 
 - `src/raw.c`
   - `raw-loop` 専用の CLI 必須引数チェック
-  - `mlx5_raw_loop()` への委譲
+  - sample 層への委譲
+
+- `src/sample.c`
+  - サンプルアプリ層
+  - `mlx5-tx-test`, `mlx5-rx-wait-test`, `raw-loop` の実装
+  - library API を使う経路と、低レベル bring-up 検証用経路の橋渡し
 
 - `src/vfio.c`
   - VFIO readiness 確認
@@ -169,11 +267,12 @@ ssh sdn-svr6 'cd ~/work/takagi/nicd && \
   - DMA map/unmap
 
 - `src/mlx5.c`
+  - library 本体
   - mlx5 command path 実装
   - HCA 初期化
   - CQ/SQ/RQ/RQT/TIR/flow table/FTE 作成破棄
   - raw TX/RX datapath 実装
-  - runtime/profile/filter primitive
+  - `mlxnicd_dev_*`, `mlxnicd_tx_burst()`, `mlxnicd_rx_burst()` の実装
 
 ## 実装の詳細解説
 

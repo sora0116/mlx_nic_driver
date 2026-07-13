@@ -1,5 +1,5 @@
+#include "mlxnicd.h"
 #include "mlx5.h"
-#include "raw.h"
 #include "vfio.h"
 
 #include <inttypes.h>
@@ -318,6 +318,15 @@ struct mlx5_run_profile {
     int create_rx_flow_table;
     int wait_rx;
     int skip_local_tx_on_rx;
+};
+
+struct mlxnicd_dev {
+    char bdf[32];
+    struct mlxnicd_dev_config config;
+    struct mlx5_test_runtime rt;
+    int started;
+    int last_error;
+    int quiet_saved;
 };
 
 static int mlx5_rx_should_skip_prefix(const struct mlx5_rx_packet *pkt,
@@ -2793,6 +2802,420 @@ static void mlx5_test_runtime_cleanup(struct mlx5_test_runtime *rt, int *rc_io) 
     }
 }
 
+void mlxnicd_dev_config_init(struct mlxnicd_dev_config *config) {
+    if (config == NULL) {
+        return;
+    }
+    memset(config, 0, sizeof(*config));
+    config->rx_post_count = MLX5_RX_TEST_POST_COUNT;
+}
+
+int mlxnicd_dev_open(struct mlxnicd_dev **out, const char *bdf) {
+    struct mlxnicd_dev *dev;
+    size_t len;
+
+    if (out == NULL || bdf == NULL || bdf[0] == '\0') {
+        fprintf(stderr, "mlxnicd_dev_open requires output pointer and BDF\n");
+        return -1;
+    }
+    len = strlen(bdf);
+    if (len >= sizeof(dev->bdf)) {
+        fprintf(stderr, "BDF is too long: %s\n", bdf);
+        return -1;
+    }
+
+    dev = calloc(1, sizeof(*dev));
+    if (dev == NULL) {
+        perror("calloc mlxnicd_dev");
+        return -1;
+    }
+    memcpy(dev->bdf, bdf, len + 1);
+    mlxnicd_dev_config_init(&dev->config);
+    mlx5_test_runtime_init(&dev->rt);
+    *out = dev;
+    return 0;
+}
+
+int mlxnicd_dev_configure(struct mlxnicd_dev *dev,
+                          const struct mlxnicd_dev_config *config) {
+    if (dev == NULL || config == NULL) {
+        fprintf(stderr, "mlxnicd_dev_configure requires device and config\n");
+        return -1;
+    }
+    if (dev->started) {
+        fprintf(stderr, "cannot configure a started mlxnicd device\n");
+        return -1;
+    }
+    if ((config->flags & (MLXNICD_DEV_F_TX | MLXNICD_DEV_F_RX)) == 0) {
+        fprintf(stderr, "mlxnicd device must enable TX and/or RX\n");
+        return -1;
+    }
+    if (config->rx_post_count > MLX5_RQ_WQE_COUNT) {
+        fprintf(stderr, "rx_post_count=%" PRIu32 " exceeds max=%u\n",
+                config->rx_post_count, MLX5_RQ_WQE_COUNT);
+        return -1;
+    }
+    dev->config = *config;
+    if (dev->config.rx_post_count == 0) {
+        dev->config.rx_post_count = MLX5_RX_TEST_POST_COUNT;
+    }
+    return 0;
+}
+
+void mlxnicd_dev_stop(struct mlxnicd_dev *dev) {
+    int rc = 0;
+
+    if (dev == NULL) {
+        return;
+    }
+    if (dev->started) {
+        mlx5_test_runtime_cleanup(&dev->rt, &rc);
+        dev->last_error = rc;
+        dev->started = 0;
+        g_mlx5_stdout_quiet = dev->quiet_saved;
+        vfio_set_stdout_quiet(0);
+        mlx5_test_runtime_init(&dev->rt);
+    }
+}
+
+void mlxnicd_dev_close(struct mlxnicd_dev *dev) {
+    if (dev == NULL) {
+        return;
+    }
+    mlxnicd_dev_stop(dev);
+    free(dev);
+}
+
+int mlxnicd_dev_last_error(const struct mlxnicd_dev *dev) {
+    return dev != NULL ? dev->last_error : -1;
+}
+
+int mlxnicd_frame_build(const struct mlxnicd_l2_frame_spec *spec,
+                        uint8_t *frame, uint32_t frame_capacity,
+                        uint32_t *frame_len) {
+    struct mlx5_tx_test_opts opts = {0};
+    size_t frame_len_local = 0;
+
+    if (spec == NULL || frame == NULL || frame_len == NULL) {
+        fprintf(stderr, "mlxnicd_frame_build requires spec/frame/frame_len\n");
+        return -1;
+    }
+    opts.dst_mac = spec->dst_mac;
+    opts.src_mac = spec->src_mac;
+    opts.ethertype = spec->ethertype;
+    opts.payload_hex = spec->payload_hex;
+    if (build_tx_test_frame(&opts, frame, frame_capacity, &frame_len_local) != 0) {
+        return -1;
+    }
+    *frame_len = (uint32_t)frame_len_local;
+    return 0;
+}
+
+int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
+    struct mlx5_test_runtime *rt;
+    uint16_t function_id;
+    uint32_t num_pages;
+    int rc = 0;
+    int want_tx;
+    int want_rx;
+
+    if (dev == NULL) {
+        fprintf(stderr, "mlxnicd_dev_start requires device\n");
+        return -1;
+    }
+    if (dev->started) {
+        return 0;
+    }
+
+    want_tx = (dev->config.flags & MLXNICD_DEV_F_TX) != 0;
+    want_rx = (dev->config.flags & MLXNICD_DEV_F_RX) != 0;
+    rt = &dev->rt;
+    mlx5_test_runtime_init(rt);
+    dev->quiet_saved = g_mlx5_stdout_quiet;
+    g_mlx5_stdout_quiet = dev->config.log_verbose ? 0 : 1;
+    vfio_set_stdout_quiet(dev->config.log_verbose ? 0 : 1);
+
+    if (mlx5_cmd_ctx_open(dev->bdf, &rt->ctx) != 0) {
+        dev->last_error = -1;
+        g_mlx5_stdout_quiet = dev->quiet_saved;
+        vfio_set_stdout_quiet(0);
+        return -1;
+    }
+
+    rc = mlx5_ctx_enable_hca(&rt->ctx);
+    if (rc != 0) {
+        goto out;
+    }
+    rc = mlx5_ctx_set_issi(&rt->ctx);
+    if (rc != 0) {
+        goto out;
+    }
+    rc = mlx5_ctx_query_pages(&rt->ctx, 1);
+    if (rc != 0) {
+        goto out;
+    }
+    {
+        uint8_t in[32] = {0};
+        uint8_t out[32] = {0};
+
+        put_be16(in, MLX5_CMD_OP_QUERY_PAGES);
+        put_be16(in + 0x06, 1);
+        rc = mlx5_cmd_exec(&rt->ctx, MLX5_CMD_OP_QUERY_PAGES, in, sizeof(in), out,
+                           sizeof(out), "api-query-boot-pages-for-give");
+        if (rc != 0) {
+            goto out;
+        }
+        function_id = get_be16(out + 0x0a);
+        num_pages = get_be32(out + 0x0c);
+        rc = mlx5_ctx_give_pages(&rt->ctx, function_id, num_pages,
+                                 "api-give-boot-pages");
+        if (rc != 0) {
+            goto out;
+        }
+    }
+    rc = mlx5_ctx_query_dtor(&rt->ctx);
+    if (rc != 0) {
+        goto out;
+    }
+    rc = mlx5_ctx_query_hca_cap_raw(
+        &rt->ctx, (MLX5_HCA_CAP_GENERAL << 1) | MLX5_HCA_CAP_GET_CUR, rt->hca_cap,
+        sizeof(rt->hca_cap), "api-query-hca-cap-general-current");
+    if (rc != 0) {
+        goto out;
+    }
+    rc = mlx5_ctx_set_hca_cap_raw(&rt->ctx, MLX5_HCA_CAP_GENERAL, rt->hca_cap,
+                                  sizeof(rt->hca_cap));
+    if (rc != 0) {
+        goto out;
+    }
+    rc = mlx5_ctx_query_pages(&rt->ctx, 0);
+    if (rc != 0) {
+        goto out;
+    }
+    {
+        uint8_t in[32] = {0};
+        uint8_t out[32] = {0};
+
+        put_be16(in, MLX5_CMD_OP_QUERY_PAGES);
+        put_be16(in + 0x06, 2);
+        rc = mlx5_cmd_exec(&rt->ctx, MLX5_CMD_OP_QUERY_PAGES, in, sizeof(in), out,
+                           sizeof(out), "api-query-init-pages-for-give");
+        if (rc != 0) {
+            goto out;
+        }
+        function_id = get_be16(out + 0x0a);
+        num_pages = get_be32(out + 0x0c);
+        rc = mlx5_ctx_give_pages(&rt->ctx, function_id, num_pages,
+                                 "api-give-init-pages");
+        if (rc != 0) {
+            goto out;
+        }
+    }
+    rc = mlx5_ctx_init_hca(&rt->ctx);
+    if (rc != 0) {
+        goto out;
+    }
+    rc = mlx5_ctx_query_paos(&rt->ctx, 1);
+    if (rc != 0) {
+        goto out;
+    }
+    if (want_rx) {
+        rc = mlx5_ctx_enable_vport_promisc(&rt->ctx);
+        if (rc != 0) {
+            goto out;
+        }
+    }
+    rc = mlx5_ctx_alloc_uar(&rt->ctx, &rt->uar);
+    if (rc != 0) {
+        goto out;
+    }
+    rc = mlx5_ctx_alloc_pd(&rt->ctx, &rt->pd);
+    if (rc != 0) {
+        goto out;
+    }
+    rc = mlx5_ctx_alloc_transport_domain(&rt->ctx, &rt->tdn);
+    if (rc != 0) {
+        goto out;
+    }
+    rt->have_tdn = 1;
+    if (want_rx) {
+        rc = mlx5_ctx_alloc_q_counter(&rt->ctx, &rt->q_counter);
+        if (rc != 0) {
+            goto out;
+        }
+        rt->have_q_counter = 1;
+    }
+    if (want_tx || want_rx) {
+        rc = mlx5_ctx_create_pa_mkey(&rt->ctx, rt->pd, &rt->mkey);
+        if (rc != 0) {
+            goto out;
+        }
+    }
+    if (want_tx) {
+        rc = mlx5_ctx_create_tis(&rt->ctx, rt->tdn, rt->pd, &rt->tisn);
+        if (rc != 0) {
+            goto out;
+        }
+        rt->have_tisn = 1;
+    }
+    rc = mlx5_ctx_create_eq(&rt->ctx, rt->uar, &rt->eq);
+    if (rc != 0) {
+        goto out;
+    }
+    rc = mlx5_ctx_create_cq(&rt->ctx, rt->uar, &rt->eq, &rt->cq);
+    if (rc != 0) {
+        goto out;
+    }
+    if (want_tx) {
+        rc = mlx5_ctx_create_sq(&rt->ctx, rt->uar, rt->pd, rt->tisn, &rt->cq,
+                                &rt->sq);
+        if (rc != 0) {
+            goto out;
+        }
+        rc = mlx5_ctx_modify_sq_ready(&rt->ctx, &rt->sq);
+        if (rc != 0) {
+            goto out;
+        }
+    }
+    if (want_rx) {
+        rc = mlx5_ctx_create_rq(&rt->ctx, rt->pd, rt->q_counter, &rt->cq, &rt->rq);
+        if (rc != 0) {
+            goto out;
+        }
+        rc = mlx5_ctx_modify_rq_ready(&rt->ctx, &rt->rq);
+        if (rc != 0) {
+            goto out;
+        }
+        rc = mlx5_ctx_create_rqt(&rt->ctx, &rt->rq, &rt->rqt);
+        if (rc != 0) {
+            goto out;
+        }
+        rc = mlx5_ctx_create_indirect_tir(&rt->ctx, rt->tdn, &rt->rqt, &rt->tir);
+        if (rc != 0) {
+            goto out;
+        }
+        rc = mlx5_rq_post_buffers(&rt->ctx, &rt->rq, rt->mkey,
+                                  dev->config.rx_post_count);
+        if (rc != 0) {
+            goto out;
+        }
+        rc = mlx5_ctx_create_rx_flow_table(&rt->ctx, &rt->ft);
+        if (rc != 0) {
+            goto out;
+        }
+        rc = mlx5_ctx_set_rx_flow_table_root(&rt->ctx, &rt->ft);
+        if (rc != 0) {
+            goto out;
+        }
+        rc = mlx5_ctx_create_rx_flow_group(&rt->ctx, &rt->ft, &rt->fg);
+        if (rc != 0) {
+            goto out;
+        }
+        rc = mlx5_ctx_set_rx_fte_to_tir(&rt->ctx, &rt->ft, &rt->fg, &rt->tir,
+                                        &rt->fte);
+        if (rc != 0) {
+            goto out;
+        }
+    }
+
+    dev->last_error = 0;
+    dev->started = 1;
+    return 0;
+
+out:
+    mlx5_test_runtime_cleanup(rt, &rc);
+    dev->last_error = rc;
+    g_mlx5_stdout_quiet = dev->quiet_saved;
+    vfio_set_stdout_quiet(0);
+    return -1;
+}
+
+uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
+                          const struct mlxnicd_pkt *pkts, uint16_t nb_pkts) {
+    uint16_t sent = 0;
+
+    if (dev == NULL || pkts == NULL) {
+        return 0;
+    }
+    if (!dev->started || (dev->config.flags & MLXNICD_DEV_F_TX) == 0) {
+        dev->last_error = -1;
+        return 0;
+    }
+
+    while (sent < nb_pkts) {
+        int rc = mlx5_sq_post_send_raw(&dev->rt.ctx, dev->rt.uar, dev->rt.tisn,
+                                       dev->rt.mkey, &dev->rt.cq, &dev->rt.sq,
+                                       pkts[sent].data, pkts[sent].len);
+        if (rc != 0) {
+            dev->last_error = rc;
+            break;
+        }
+        sent++;
+    }
+    if (sent == nb_pkts) {
+        dev->last_error = 0;
+    }
+    return sent;
+}
+
+static int mlx5_rx_poll_one_api(struct mlxnicd_dev *dev, int timeout_ms,
+                                struct mlx5_rx_packet *pkt) {
+    return mlx5_rx_poll_one(&dev->rt.cq, &dev->rt.rq, timeout_ms, pkt);
+}
+
+uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
+                          uint16_t nb_pkts, int timeout_ms) {
+    uint16_t received = 0;
+
+    if (dev == NULL || pkts == NULL) {
+        return 0;
+    }
+    if (!dev->started || (dev->config.flags & MLXNICD_DEV_F_RX) == 0) {
+        dev->last_error = -1;
+        return 0;
+    }
+
+    while (received < nb_pkts) {
+        struct mlx5_rx_packet pkt = {0};
+        int rc = mlx5_rx_poll_one_api(dev, received == 0 ? timeout_ms : 0, &pkt);
+
+        if (rc != 0) {
+            if (received == 0) {
+                dev->last_error = 0;
+            }
+            break;
+        }
+        pkts[received].data = pkt.data;
+        pkts[received].len = pkt.len;
+        received++;
+    }
+    if (received > 0) {
+        dev->last_error = 0;
+    }
+    return received;
+}
+
+int mlxnicd_rx_release(struct mlxnicd_dev *dev, uint16_t nb_pkts) {
+    uint16_t i;
+
+    if (dev == NULL) {
+        return -1;
+    }
+    if (!dev->started || (dev->config.flags & MLXNICD_DEV_F_RX) == 0) {
+        dev->last_error = -1;
+        return -1;
+    }
+    for (i = 0; i < nb_pkts; i++) {
+        int rc = mlx5_rx_replenish_one(&dev->rt.ctx, &dev->rt.rq, dev->rt.mkey);
+        if (rc != 0) {
+            dev->last_error = rc;
+            return -1;
+        }
+    }
+    dev->last_error = 0;
+    return 0;
+}
+
 static int mlx5_run_profile(const char *bdf,
                             const struct mlx5_tx_test_opts *opts,
                             const struct mlx5_run_profile *profile,
@@ -3055,36 +3478,6 @@ out:
     return rc;
 }
 
-int mlx5_seq_basic(const char *bdf) {
-    struct mlx5_tx_test_opts opts = {0};
-    static const struct mlx5_run_profile profile = {
-        .banner = "mlx5-seq-basic",
-        .do_tx = 1,
-    };
-
-    opts.count = 1;
-    return mlx5_run_profile(bdf, &opts, &profile, 0, 0, 0, NULL);
-}
-
-int mlx5_tx_test(const char *bdf, unsigned int count) {
-    struct mlx5_tx_test_opts opts = {0};
-    static const struct mlx5_run_profile profile = {
-        .banner = "mlx5-tx-test",
-        .do_tx = 1,
-    };
-
-    opts.count = count;
-    return mlx5_run_profile(bdf, &opts, &profile, 0, 0, 0, NULL);
-}
-
-int mlx5_tx_test_opts(const char *bdf, const struct mlx5_tx_test_opts *opts) {
-    static const struct mlx5_run_profile profile = {
-        .banner = "mlx5-tx-test",
-        .do_tx = 1,
-    };
-    return mlx5_run_profile(bdf, opts, &profile, 0, 0, 0, NULL);
-}
-
 int mlx5_rx_objects(const char *bdf) {
     struct mlx5_tx_test_opts opts = {0};
     static const struct mlx5_run_profile profile = {
@@ -3119,90 +3512,4 @@ int mlx5_rx_steer_test(const char *bdf) {
 
     opts.count = 1;
     return mlx5_run_profile(bdf, &opts, &profile, 0, 0, 0, NULL);
-}
-
-int mlx5_rx_wait_test(const char *bdf) {
-    struct mlx5_tx_test_opts opts = {0};
-    static const struct mlx5_run_profile profile = {
-        .banner = "mlx5-rx-wait-test",
-        .create_rx_objects = 1,
-        .post_rx = 1,
-        .create_rx_flow_table = 1,
-        .wait_rx = 1,
-    };
-
-    opts.count = 1;
-    return mlx5_run_profile(bdf, &opts, &profile, MLX5_RX_TEST_WAIT_COUNT, 0,
-                            30000, NULL);
-}
-
-int mlx5_raw_loop(const struct raw_loop_opts *raw_opts) {
-    struct mlx5_tx_test_opts opts = {0};
-    struct mlx5_rx_wait_stats rx_stats = {0};
-    static const struct mlx5_run_profile profile = {
-        .banner = "raw-loop",
-        .do_tx = 1,
-        .create_rx_objects = 1,
-        .post_rx = 1,
-        .create_rx_flow_table = 1,
-        .wait_rx = 1,
-        .skip_local_tx_on_rx = 1,
-    };
-    uint32_t rx_wait_count;
-    int rx_pre_delay_ms;
-    int rx_timeout_ms;
-    int quiet_saved;
-    int rc;
-
-    if (raw_opts == NULL) {
-        fprintf(stderr, "raw-loop options are required\n");
-        return -1;
-    }
-
-    opts.dst_mac = raw_opts->dst_mac;
-    opts.src_mac = raw_opts->src_mac;
-    opts.ethertype = raw_opts->ethertype;
-    opts.payload_hex = raw_opts->payload_hex != NULL ? raw_opts->payload_hex
-                                                     : "6d6c786e6963642d7261772d6c6f6f70";
-    opts.count = 1;
-    rx_wait_count =
-        raw_opts->rx_count != 0 ? raw_opts->rx_count : MLX5_RX_TEST_WAIT_COUNT;
-    rx_pre_delay_ms = raw_opts->pre_rx_delay_ms != 0
-                          ? (int)raw_opts->pre_rx_delay_ms
-                          : 0;
-    rx_timeout_ms =
-        raw_opts->timeout_ms != 0 ? (int)raw_opts->timeout_ms : 30000;
-
-    fprintf(stdout, "raw-loop: peer-if=%s bdf=%s\n", raw_opts->peer_if,
-            raw_opts->bdf);
-    fprintf(stdout, "raw-loop: TX dst=%s src=%s ethertype=%s\n",
-            raw_opts->dst_mac, raw_opts->src_mac, raw_opts->ethertype);
-    fprintf(stdout,
-            "raw-loop: RX waits for %" PRIu32
-            " packet(s), pre-rx-delay=%d ms, timeout=%d ms\n",
-            rx_wait_count, rx_pre_delay_ms, rx_timeout_ms);
-
-    quiet_saved = g_mlx5_stdout_quiet;
-    g_mlx5_stdout_quiet = raw_opts->verbose ? 0 : 1;
-    vfio_set_stdout_quiet(raw_opts->verbose ? 0 : 1);
-    rc = mlx5_run_profile(raw_opts->bdf, &opts, &profile, rx_wait_count,
-                          rx_pre_delay_ms, rx_timeout_ms, &rx_stats);
-    g_mlx5_stdout_quiet = quiet_saved;
-    vfio_set_stdout_quiet(0);
-    if (rc == 0) {
-        fprintf(stdout,
-                "raw-loop: ok tx=1 rx=%" PRIu32
-                " skipped_local=%" PRIu32 " skipped_filtered=%" PRIu32
-                "\n",
-                rx_stats.accepted, rx_stats.skipped_local,
-                rx_stats.skipped_filtered);
-    } else {
-        fprintf(stdout,
-                "raw-loop: failed tx=1 rx=%" PRIu32
-                " skipped_local=%" PRIu32 " skipped_filtered=%" PRIu32
-                "\n",
-                rx_stats.accepted, rx_stats.skipped_local,
-                rx_stats.skipped_filtered);
-    }
-    return rc;
 }
