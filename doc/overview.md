@@ -20,5 +20,6 @@
 対応する説明文:
 
 - 背景知識: [fundamentals.md](/home/sora/work/mlxnicd/doc/fundamentals.md)
+- 動作フロー: [behavior.md](/home/sora/work/mlxnicd/doc/behavior.md)
 - 実装解説: [README.md](/home/sora/work/mlxnicd/README.md)
 - 運用 handoff: [agent-handoff.md](/home/sora/work/mlxnicd/docs/agent-handoff.md)

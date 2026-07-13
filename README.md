@@ -10,6 +10,8 @@ raw Ethernet frame の送受信を確認することを目的にしています�
 
 全体の動作を図で見たい場合は [doc/overview.md](/home/sora/work/mlxnicd/doc/overview.md)
 と [doc/overview.svg](/home/sora/work/mlxnicd/doc/overview.svg) を参照してください。
+`raw-loop` を中心に時系列で追いたい場合は
+[doc/behavior.md](/home/sora/work/mlxnicd/doc/behavior.md) を参照してください。
 
 現時点の到達点は次です。
 
