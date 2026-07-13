@@ -235,6 +235,218 @@ NIC 本体を HCA と呼ぶことが多いです。
 
 `INIT_HCA`, `ENABLE_HCA` はこの HCA を動作状態に持っていく command です。
 
+この言葉は「ただの NIC の別名」として使われることもありますが、
+driver 実装の文脈ではもう少し広い意味を持ちます。HCA という言葉が出たときは、
+たいてい次のどれかを指しています。
+
+- 物理的な NIC デバイスそのもの
+- NIC 内部の mlx5 firmware / command processor を含んだ制御対象全体
+- queue object, memory key, transport object などを保持している device 側の状態機械
+
+このプロジェクトでは、HCA はほぼ「userspace から直接初期化し、object を作り、
+queue を走らせる対象全体」という意味で使っています。
+
+#### HCA を初期化するとは何か
+
+Linux kernel driver を使うと、この初期化は普通は見えません。driver が probe 時に
+裏でやってくれるからです。userspace driver では、その隠れていた初期化手順の
+一部を自分で実行する必要があります。
+
+大きな流れは次です。
+
+1. PCIe device として device を掴む
+2. BAR0 にアクセスできるようにする
+3. command queue を使えるようにする
+4. device capability を読む
+5. firmware が要求する page を渡す
+6. HCA を初期化して operational state に持っていく
+7. その上で CQ/SQ/RQ/TIR/TIS などの object を作る
+
+つまり `INIT_HCA` は終点ではなく、queue を作る前段の「device 全体の土台を整える」
+ための手順です。
+
+#### HCA 初期化前と初期化後の違い
+
+概念的には次の違いがあります。
+
+- 初期化前
+  - command path は一部しか使えない
+  - datapath object はまだ作れない、または意味を持たない
+  - queue を動かす前提が整っていない
+
+- 初期化後
+  - HCA capability に応じた object 作成ができる
+  - PD/UAR/MKEY/CQ/SQ/RQ などを組み立てられる
+  - send/receive datapath を立ち上げる準備ができる
+
+この区別が重要なのは、userspace driver では failure point が多いからです。
+たとえば TX が動かないとき、
+
+- HCA 自体がまだ正しく初期化されていないのか
+- object 作成は済んでいるが queue 遷移が間違っているのか
+- queue は正しいが flow steering が足りないのか
+
+を切り分ける必要があります。
+
+#### mlxnicd での HCA bring-up
+
+このプロジェクトの `src/mlx5.c` では、HCA bring-up は大まかに次の段階に
+分かれています。
+
+1. VFIO device open
+   - `vfio_device_open()`
+   - BAR0 mmap
+   - DMA map 準備
+
+2. command path open
+   - `mlx5_cmd_ctx_open()`
+   - command queue 用 DMA 領域確保
+   - command mailbox 相当の準備
+
+3. 初期 capability / mode 確認
+   - `QUERY_ISSI`
+   - `SET_ISSI`
+   - `QUERY_HCA_CAP`
+
+4. firmware page handoff
+   - `QUERY_PAGES`
+   - `MANAGE_PAGES`
+
+5. HCA activation
+   - `ENABLE_HCA`
+   - `INIT_HCA`
+
+6. port / datapath 前提確認
+   - PAOS query
+   - 必要なら promisc 設定
+
+7. datapath object 作成
+   - UAR
+   - PD
+   - transport domain
+   - MKEY
+   - EQ/CQ
+   - SQ/RQ
+   - TIS/TIR/RQT/flow table
+
+このうち 1-5 が狭い意味での HCA bring-up、6-7 が「使える NIC にするための
+実運用寄り初期化」と考えるとわかりやすいです。
+
+#### HCA と firmware の関係
+
+mlx5 device はかなり firmware 主導です。software が勝手に register を少し叩けば
+すぐ packet が流れるタイプではありません。まず firmware が期待する順序で command を
+実行し、必要な page を渡し、capability に沿って object を作る必要があります。
+
+この意味で HCA は:
+
+- 単なる register 集合
+
+ではなく、
+
+- firmware が管理する object machine
+
+として見る方が実装に近いです。
+
+`CREATE_SQ`, `CREATE_RQ`, `CREATE_CQ`, `CREATE_TIR` などは、
+device memory 上の何かを直接自分で構築するというより、
+firmware に「こういう object を持ってくれ」と依頼する操作です。
+
+#### HCA capability とは何か
+
+HCA capability は、その device が何をサポートしているかの一覧です。
+
+例:
+
+- queue のサイズ上限
+- inline の制約
+- transport / steering のサポート有無
+- page 関連制約
+- checksum / offload 関連機能
+
+userspace driver 実装では、capability を読まずに決め打ちで進むと、
+
+- object field の意味を誤る
+- unsupported mode を選ぶ
+- queue parameter が hardware 制約を超える
+
+といった形で壊れます。
+
+このプロジェクトでは最小構成を優先しているため capability 利用はまだ限定的ですが、
+本来は HCA capability を参照して object parameter を決めるのが正道です。
+
+#### HCA と port の違い
+
+HCA は device 全体、port はその外向きのインタフェースです。
+
+たとえば ConnectX-5 Ex の dual-port card では、
+
+- HCA
+  - 1 つの device / function が持つ制御主体
+- port
+  - 物理リンクや MAC 側の出入り口
+
+という関係になります。
+
+このプロジェクトでは:
+
+- `0000:01:00.0`
+  - 1 つの PCI function として userspace が HCA 側を握る
+- `0000:01:00.1`
+  - 別 function / 別 netdev を Linux 側 peer として使う
+
+という形です。
+
+PAOS や PPCNT のような register access は port 寄りの概念で、
+PD/CQ/SQ/RQ/TIR は HCA 内 object 寄りの概念です。両者は近いですが別物です。
+
+#### HCA と datapath object の関係
+
+datapath object は HCA の上にぶら下がります。概念的には:
+
+```text
+HCA
+  ├─ UAR
+  ├─ PD
+  ├─ transport domain
+  ├─ MKEY
+  ├─ EQ / CQ
+  ├─ SQ / TIS
+  └─ RQ / RQT / TIR / flow table
+```
+
+つまり queue は host memory 上だけに存在するのではなく、
+
+- host 側には DMA-backed ring や doorbell record があり
+- HCA 側にはそれを参照する object state がある
+
+という二重構造になっています。
+
+この構造を理解しておくと、
+
+- memory を確保しただけでは queue にならない
+- command で object を作っただけでも queue buffer を貼らないと動かない
+
+という点が自然に見えます。
+
+#### HCA bring-up に失敗したときの典型症状
+
+典型的な failure mode は次です。
+
+- `QUERY_ISSI` / `SET_ISSI` が通らない
+  - command path 基盤が壊れている
+- `QUERY_PAGES` / `MANAGE_PAGES` が不整合
+  - firmware page handoff が足りない
+- `INIT_HCA` 後に object create が失敗する
+  - capability や object field が不正
+- SQ/RQ create は通るのに packet が流れない
+  - HCA 初期化後の datapath 組み立てが不十分
+- RX completion が来ない
+  - flow steering / TIR / RQT / RQ のどこかが不整合
+
+このため、HCA という言葉を「probe のときに一回初期化して終わり」ではなく、
+driver 全体の状態機械の中心として理解しておくと実装の見通しがよくなります。
+
 ### UAR とは
 
 UAR は User Access Region です。doorbell を叩くための MMIO 領域です。

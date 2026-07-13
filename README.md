@@ -8,6 +8,9 @@ raw Ethernet frame の送受信を確認することを目的にしています�
 を読むと追いやすいです。PCIe, VFIO, DMA, mlx5 用語, queue/object の概念を
 このリポジトリの文脈でまとめています。
 
+全体の動作を図で見たい場合は [doc/overview.md](/home/sora/work/mlxnicd/doc/overview.md)
+と [doc/overview.svg](/home/sora/work/mlxnicd/doc/overview.svg) を参照してください。
+
 現時点の到達点は次です。
 
 - userspace から ConnectX-5 Ex を VFIO で所有できる

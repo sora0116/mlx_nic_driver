@@ -1,0 +1,193 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1400" viewBox="0 0 1600 1400">
+  <defs>
+    <style>
+      .title { font: 700 28px sans-serif; fill: #111827; }
+      .section { font: 700 22px sans-serif; fill: #111827; }
+      .body { font: 16px sans-serif; fill: #1f2937; }
+      .small { font: 14px sans-serif; fill: #374151; }
+      .mono { font: 14px monospace; fill: #111827; }
+      .box { fill: #ffffff; stroke: #334155; stroke-width: 2; rx: 12; ry: 12; }
+      .soft { fill: #f8fafc; stroke: #94a3b8; stroke-width: 2; rx: 12; ry: 12; }
+      .accent { fill: #eff6ff; stroke: #2563eb; stroke-width: 2; rx: 12; ry: 12; }
+      .green { fill: #ecfdf5; stroke: #059669; stroke-width: 2; rx: 12; ry: 12; }
+      .amber { fill: #fffbeb; stroke: #d97706; stroke-width: 2; rx: 12; ry: 12; }
+      .gray { fill: #f3f4f6; stroke: #6b7280; stroke-width: 2; rx: 12; ry: 12; }
+      .arrow { stroke: #2563eb; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .arrow2 { stroke: #059669; stroke-width: 3; fill: none; marker-end: url(#arrowhead2); }
+      .arrow3 { stroke: #d97706; stroke-width: 3; fill: none; marker-end: url(#arrowhead3); }
+      .divider { stroke: #cbd5e1; stroke-width: 2; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowhead2" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#059669"/>
+    </marker>
+    <marker id="arrowhead3" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#d97706"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="45" class="title">mlxnicd overview</text>
+  <text x="40" y="72" class="body">VFIO + mlx5 command path + SQ/RQ/CQ による raw packet TX/RX の全体像</text>
+
+  <rect x="30" y="95" width="1540" height="280" class="soft"/>
+  <text x="50" y="130" class="section">1. 物理配置 / ownership</text>
+
+  <rect x="60" y="155" width="640" height="180" class="box"/>
+  <text x="85" y="185" class="section">sdn-svr6</text>
+  <rect x="85" y="205" width="200" height="105" class="accent"/>
+  <text x="100" y="232" class="body">userspace process</text>
+  <text x="100" y="255" class="mono">mlxnicd</text>
+  <text x="100" y="278" class="small">raw-loop / mlx5-rx-wait-test</text>
+
+  <rect x="315" y="205" width="165" height="105" class="gray"/>
+  <text x="330" y="232" class="body">VFIO / IOMMU</text>
+  <text x="330" y="255" class="small">device fd</text>
+  <text x="330" y="278" class="small">BAR0 mmap / DMA map</text>
+
+  <rect x="510" y="205" width="160" height="105" class="green"/>
+  <text x="525" y="232" class="body">ConnectX-5 Ex</text>
+  <text x="525" y="255" class="mono">0000:01:00.0</text>
+  <text x="525" y="278" class="small">vfio-pci</text>
+
+  <rect x="510" y="315" width="160" height="35" class="amber"/>
+  <text x="525" y="338" class="small">peer port: 0000:01:00.1 / eth2</text>
+
+  <line x1="285" y1="258" x2="315" y2="258" class="arrow"/>
+  <line x1="480" y1="258" x2="510" y2="258" class="arrow"/>
+
+  <rect x="865" y="180" width="260" height="130" class="box"/>
+  <text x="885" y="210" class="section">wire</text>
+  <text x="885" y="238" class="small">raw Ethernet frame</text>
+  <text x="885" y="262" class="small">broadcast or peer-targeted packet</text>
+
+  <rect x="1210" y="155" width="300" height="180" class="box"/>
+  <text x="1230" y="185" class="section">sdn-svr5</text>
+  <rect x="1235" y="205" width="245" height="105" class="accent"/>
+  <text x="1250" y="232" class="body">peer tools</text>
+  <text x="1250" y="255" class="small">AF_PACKET sender</text>
+  <text x="1250" y="278" class="small">tcpdump / test helper</text>
+
+  <line x1="670" y1="258" x2="865" y2="245" class="arrow2"/>
+  <line x1="1125" y1="245" x2="1210" y2="258" class="arrow2"/>
+
+  <rect x="30" y="400" width="1540" height="330" class="soft"/>
+  <text x="50" y="435" class="section">2. bring-up sequence</text>
+
+  <rect x="70" y="470" width="180" height="85" class="accent"/>
+  <text x="88" y="498" class="body">1. VFIO open</text>
+  <text x="88" y="522" class="small">vfio_device_open()</text>
+  <text x="88" y="544" class="small">BAR0 mmap / DMA map準備</text>
+
+  <rect x="290" y="470" width="180" height="85" class="accent"/>
+  <text x="308" y="498" class="body">2. command path open</text>
+  <text x="308" y="522" class="small">mlx5_cmd_ctx_open()</text>
+  <text x="308" y="544" class="small">command queue DMA確保</text>
+
+  <rect x="510" y="470" width="220" height="85" class="green"/>
+  <text x="528" y="498" class="body">3. capability / mode</text>
+  <text x="528" y="522" class="mono">QUERY_ISSI / SET_ISSI</text>
+  <text x="528" y="544" class="mono">QUERY_HCA_CAP</text>
+
+  <rect x="770" y="470" width="190" height="85" class="green"/>
+  <text x="788" y="498" class="body">4. firmware pages</text>
+  <text x="788" y="522" class="mono">QUERY_PAGES</text>
+  <text x="788" y="544" class="mono">MANAGE_PAGES</text>
+
+  <rect x="1000" y="470" width="190" height="85" class="green"/>
+  <text x="1018" y="498" class="body">5. HCA activation</text>
+  <text x="1018" y="522" class="mono">ENABLE_HCA</text>
+  <text x="1018" y="544" class="mono">INIT_HCA</text>
+
+  <rect x="1230" y="470" width="290" height="85" class="amber"/>
+  <text x="1248" y="498" class="body">6. datapath objects</text>
+  <text x="1248" y="522" class="small">UAR / PD / TD / MKEY / EQ / CQ</text>
+  <text x="1248" y="544" class="small">SQ / RQ / RQT / TIR / FT / FTE</text>
+
+  <line x1="250" y1="512" x2="290" y2="512" class="arrow"/>
+  <line x1="470" y1="512" x2="510" y2="512" class="arrow"/>
+  <line x1="730" y1="512" x2="770" y2="512" class="arrow"/>
+  <line x1="960" y1="512" x2="1000" y2="512" class="arrow"/>
+  <line x1="1190" y1="512" x2="1230" y2="512" class="arrow"/>
+
+  <rect x="95" y="595" width="1420" height="95" class="box"/>
+  <text x="120" y="625" class="body">ここでのポイント</text>
+  <text x="120" y="651" class="small">- queue を動かす前に HCA を command path で初期化する</text>
+  <text x="120" y="673" class="small">- host memory を確保しただけでは queue にならず、device 側 object も必要</text>
+
+  <rect x="30" y="755" width="1540" height="285" class="soft"/>
+  <text x="50" y="790" class="section">3. TX path</text>
+
+  <rect x="70" y="825" width="220" height="85" class="accent"/>
+  <text x="88" y="853" class="body">build_tx_test_frame()</text>
+  <text x="88" y="877" class="small">dst/src MAC + EtherType + payload</text>
+
+  <rect x="340" y="825" width="210" height="85" class="accent"/>
+  <text x="358" y="853" class="body">mlx5_sq_post_send_raw()</text>
+  <text x="358" y="877" class="small">full-inline SEND WQE 作成</text>
+
+  <rect x="600" y="825" width="180" height="85" class="green"/>
+  <text x="618" y="853" class="body">SQ</text>
+  <text x="618" y="877" class="small">WQE ring</text>
+
+  <rect x="830" y="825" width="170" height="85" class="green"/>
+  <text x="848" y="853" class="body">UAR doorbell</text>
+  <text x="848" y="877" class="small">device に通知</text>
+
+  <rect x="1050" y="825" width="180" height="85" class="box"/>
+  <text x="1068" y="853" class="body">wire</text>
+  <text x="1068" y="877" class="small">packet送信</text>
+
+  <rect x="1280" y="825" width="180" height="85" class="amber"/>
+  <text x="1298" y="853" class="body">CQ / TX CQE</text>
+  <text x="1298" y="877" class="small">completion確認</text>
+
+  <line x1="290" y1="867" x2="340" y2="867" class="arrow2"/>
+  <line x1="550" y1="867" x2="600" y2="867" class="arrow2"/>
+  <line x1="780" y1="867" x2="830" y2="867" class="arrow2"/>
+  <line x1="1000" y1="867" x2="1050" y2="867" class="arrow2"/>
+  <line x1="1230" y1="867" x2="1280" y2="867" class="arrow2"/>
+
+  <rect x="90" y="945" width="1380" height="60" class="box"/>
+  <text x="115" y="982" class="small">TX は「frame構築 → SEND WQE → doorbell → wire → TX completion」の順で進む。現実装の最初の TX は full-inline SEND。</text>
+
+  <rect x="30" y="1065" width="1540" height="300" class="soft"/>
+  <text x="50" y="1100" class="section">4. RX path / raw-loop</text>
+
+  <rect x="70" y="1135" width="210" height="85" class="accent"/>
+  <text x="88" y="1163" class="body">mlx5_rq_post_buffers()</text>
+  <text x="88" y="1187" class="small">RX buffer を RQ に投入</text>
+
+  <rect x="320" y="1135" width="320" height="85" class="green"/>
+  <text x="338" y="1163" class="body">flow steering</text>
+  <text x="338" y="1187" class="small">flow table → FTE → TIR → RQT → RQ</text>
+
+  <rect x="680" y="1135" width="170" height="85" class="box"/>
+  <text x="698" y="1163" class="body">wire</text>
+  <text x="698" y="1187" class="small">peer packet到着</text>
+
+  <rect x="890" y="1135" width="190" height="85" class="amber"/>
+  <text x="908" y="1163" class="body">CQ / RX CQE</text>
+  <text x="908" y="1187" class="small">packet completion</text>
+
+  <rect x="1120" y="1135" width="200" height="85" class="accent"/>
+  <text x="1138" y="1163" class="body">mlx5_rx_poll_one()</text>
+  <text x="1138" y="1187" class="small">slot / len / data を取得</text>
+
+  <rect x="1360" y="1135" width="180" height="85" class="accent"/>
+  <text x="1378" y="1163" class="body">replenish</text>
+  <text x="1378" y="1187" class="small">RQ slot を再投入</text>
+
+  <line x1="280" y1="1177" x2="320" y2="1177" class="arrow3"/>
+  <line x1="640" y1="1177" x2="680" y2="1177" class="arrow3"/>
+  <line x1="850" y1="1177" x2="890" y2="1177" class="arrow3"/>
+  <line x1="1080" y1="1177" x2="1120" y2="1177" class="arrow3"/>
+  <line x1="1320" y1="1177" x2="1360" y2="1177" class="arrow3"/>
+
+  <rect x="90" y="1248" width="1450" height="80" class="box"/>
+  <text x="115" y="1278" class="body">raw-loop の追加挙動</text>
+  <text x="115" y="1304" class="small">- TX を 1 回出したあと RX を待つ</text>
+  <text x="460" y="1304" class="small">- local TX loopback は RX skip filter で無視する</text>
+  <text x="950" y="1304" class="small">- peer packet だけ count して summary を出す</text>
+</svg>
