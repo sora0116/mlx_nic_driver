@@ -94,6 +94,10 @@ Internal implementation state:
 implementation, including function roles, argument meaning, return values, and
 how the runtime/profile/filter pieces fit together.
 
+Background terminology and conceptual material are now in
+`doc/fundamentals.md`. Use that document first if an agent or human needs
+PCIe/VFIO/DMA/mlx5 vocabulary before reading the code.
+
 ## Current sdn-svr6 state
 
 Verified after reboot:

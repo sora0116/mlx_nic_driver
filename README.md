@@ -4,6 +4,10 @@
 VFIO + BAR0 + DMA を使って mlx5 command path と TX/RX queue を直接扱い、
 raw Ethernet frame の送受信を確認することを目的にしています。
 
+背景知識が必要な場合は、先に [doc/fundamentals.md](/home/sora/work/mlxnicd/doc/fundamentals.md)
+を読むと追いやすいです。PCIe, VFIO, DMA, mlx5 用語, queue/object の概念を
+このリポジトリの文脈でまとめています。
+
 現時点の到達点は次です。
 
 - userspace から ConnectX-5 Ex を VFIO で所有できる
