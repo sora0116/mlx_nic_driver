@@ -321,6 +321,33 @@ ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-flood \
   --rss-udp --queues 8 --count 100000000'
 ```
 
+### Final validation log
+
+The final investigation proceeded as follows.
+
+1. The original `raw-bench` rate of 16.1 Mpps was separated from a one-way
+   limit by adding `raw-flood`.  With 66-byte frames, this reached 33.0 Mpps
+   (17.42 Gb/s) losslessly, showing that request/reply accounting had hidden
+   much of the available one-way capacity.
+2. Increasing the SQ from 2,048 to 8,192 WQEBBs and moving TX reclamation to
+   explicit producer/consumer tracking made sustained flood traffic safe.  It
+   did not by itself move the 33 Mpps small-frame plateau, which is expected:
+   the receiver's PCIe DMA capacity rather than an unsafe SQ limit was then
+   dominant.
+3. At the driver's maximum 98-byte inline frame, the first RX-only peer
+   configuration achieved 20.084 Gb/s but recorded 12,971 `RX-missed` packets
+   out of 50M.  The NIC reported no physical discards and DPDK reported no
+   mbuf allocation failures, isolating the loss to the software RX descriptor
+   ring/lcore scheduling.
+4. Moving `testpmd`'s main lcore to CPU 0, keeping its eight workers on CPUs
+   1--8, and increasing `--rxd` from 2048 to 8192 removed that loss.  The
+   configuration then reproduced 20.186 Gb/s for 50M packets and 20.248 Gb/s
+   for 100M packets, both with `RX-missed=0`.
+
+The implementation and this result were committed on the `benchmark` branch
+as `0caeda0` (`Benchmark PCIe effective throughput`).  `references/` remains
+local research material and is intentionally not part of that commit.
+
 ## Next work
 
 The 10 Mpps target is met.  Follow-on work should retain this benchmark as a
