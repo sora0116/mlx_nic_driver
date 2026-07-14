@@ -226,6 +226,9 @@ print("sent",20,"frames on",iface)
 `raw-bench` は `sdn-svr6 -> NIC -> wire -> sdn-svr5 forwarding -> wire -> NIC -> sdn-svr6`
 の往復を使って RTT と aggregate throughput を測るための sample command です。
 
+10 Mpps に向けた実測結果、効果があった施策と効果がなかった施策は
+[benchmark-10mpps.md](docs/benchmark-10mpps.md) に継続して記録する。
+
 ```sh
 ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-bench \
   --bdf 0000:01:00.0 \

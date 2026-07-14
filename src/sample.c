@@ -16,9 +16,10 @@ enum {
     MLXNICD_SAMPLE_RX_WAIT_COUNT = 20,
     MLXNICD_SAMPLE_BENCH_MAGIC = 0x4d4c5842,
     MLXNICD_SAMPLE_BENCH_HDR_LEN = 24,
-    /* A full-inline frame consumes two 64-byte SQ WQEBBs; SQ has 256. */
-    MLXNICD_SAMPLE_BENCH_MAX_WINDOW = 128,
-    MLXNICD_SAMPLE_BENCH_RX_POST_COUNT = 256,
+    /* A full-inline frame consumes two 64-byte SQ WQEBBs; SQ has 2048. */
+    MLXNICD_SAMPLE_BENCH_MAX_WINDOW = 1024,
+    MLXNICD_SAMPLE_BENCH_RX_BURST = 128,
+    MLXNICD_SAMPLE_BENCH_RX_POST_COUNT = 4096,
     MLXNICD_SAMPLE_BENCH_F_REPLY = 0x0001,
 };
 
@@ -211,6 +212,22 @@ static double sample_rate_gbps(uint64_t bytes, uint64_t span_ns) {
     return ((double)bytes * 8.0) / (double)span_ns;
 }
 
+static size_t sample_bench_header_offset(const struct raw_bench_opts *opts) {
+    return opts->rss_udp ? 14 + 20 + 8 : 14;
+}
+
+static uint16_t sample_ipv4_checksum(const uint8_t *header, size_t len) {
+    uint32_t sum = 0;
+
+    for (size_t i = 0; i < len; i += 2) {
+        sum += sample_get_be16(header + i);
+    }
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xffffu) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
+
 static int sample_bench_build_frame(const struct raw_bench_opts *opts,
                                     uint32_t seq, uint64_t send_ns,
                                     uint16_t flags,
@@ -218,10 +235,10 @@ static int sample_bench_build_frame(const struct raw_bench_opts *opts,
                                     uint32_t *frame_len) {
     uint8_t dst[6];
     uint8_t src[6];
-    uint8_t extra_payload[MLXNICD_SAMPLE_TX_FRAME_CAPACITY - 14 -
-                          MLXNICD_SAMPLE_BENCH_HDR_LEN];
+    uint8_t extra_payload[MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
     size_t extra_payload_len = 0;
     uint16_t ethertype = 0;
+    size_t header_off;
     size_t len;
 
     if (opts == NULL || frame == NULL || frame_len == NULL) {
@@ -243,6 +260,11 @@ static int sample_bench_build_frame(const struct raw_bench_opts *opts,
         fprintf(stderr, "invalid --ethertype: %s\n", opts->ethertype);
         return -1;
     }
+    if (opts->rss_udp && ethertype != 0x0800) {
+        fprintf(stderr, "--rss-udp requires --ethertype 0x0800\n");
+        return -1;
+    }
+    header_off = sample_bench_header_offset(opts);
     if (sample_parse_payload_hex(opts->payload_hex, extra_payload,
                                  sizeof(extra_payload),
                                  &extra_payload_len) != 0) {
@@ -252,7 +274,7 @@ static int sample_bench_build_frame(const struct raw_bench_opts *opts,
         return -1;
     }
 
-    len = 14 + MLXNICD_SAMPLE_BENCH_HDR_LEN + extra_payload_len;
+    len = header_off + MLXNICD_SAMPLE_BENCH_HDR_LEN + extra_payload_len;
     if (len < 60) {
         len = 60;
     }
@@ -266,15 +288,55 @@ static int sample_bench_build_frame(const struct raw_bench_opts *opts,
     memcpy(frame + 0, dst, sizeof(dst));
     memcpy(frame + 6, src, sizeof(src));
     sample_put_be16(frame + 12, ethertype);
-    sample_put_be32(frame + 14, MLXNICD_SAMPLE_BENCH_MAGIC);
-    sample_put_be16(frame + 18, 1);
-    sample_put_be16(frame + 20, flags);
-    sample_put_be32(frame + 22, seq);
-    sample_put_be64(frame + 26, send_ns);
-    sample_put_be32(frame + 34, (uint32_t)extra_payload_len);
-    memcpy(frame + 38, extra_payload, extra_payload_len);
+    if (opts->rss_udp) {
+        uint8_t *ip = frame + 14;
+        uint8_t *udp = ip + 20;
+
+        ip[0] = 0x45;
+        sample_put_be16(ip + 2, (uint16_t)(len - 14));
+        sample_put_be16(ip + 4, (uint16_t)seq);
+        sample_put_be16(ip + 6, 0x4000);
+        ip[8] = 64;
+        ip[9] = 17;
+        ip[12] = 192; ip[13] = 0; ip[14] = 2; ip[15] = 6;
+        ip[16] = 192; ip[17] = 0; ip[18] = 2; ip[19] = 5;
+        sample_put_be16(ip + 10, sample_ipv4_checksum(ip, 20));
+        sample_put_be16(udp, (uint16_t)(10000u + (seq % 50000u)));
+        sample_put_be16(udp + 2, 20000);
+        sample_put_be16(udp + 4, (uint16_t)(len - 14 - 20));
+    }
+    sample_put_be32(frame + header_off, MLXNICD_SAMPLE_BENCH_MAGIC);
+    sample_put_be16(frame + header_off + 4, 1);
+    sample_put_be16(frame + header_off + 6, flags);
+    sample_put_be32(frame + header_off + 8, seq);
+    sample_put_be64(frame + header_off + 12, send_ns);
+    sample_put_be32(frame + header_off + 20, (uint32_t)extra_payload_len);
+    memcpy(frame + header_off + MLXNICD_SAMPLE_BENCH_HDR_LEN, extra_payload,
+           extra_payload_len);
     *frame_len = (uint32_t)len;
     return 0;
+}
+
+static void sample_bench_build_from_template(const struct raw_bench_opts *opts,
+                                             const uint8_t *template_frame,
+                                             uint32_t template_len,
+                                             uint32_t seq, uint64_t send_ns,
+                                             uint16_t flags, uint8_t *frame) {
+    size_t header_off = sample_bench_header_offset(opts);
+
+    memcpy(frame, template_frame, template_len);
+    if (opts->rss_udp) {
+        uint8_t *ip = frame + 14;
+        uint8_t *udp = ip + 20;
+
+        sample_put_be16(ip + 4, (uint16_t)seq);
+        sample_put_be16(ip + 10, 0);
+        sample_put_be16(ip + 10, sample_ipv4_checksum(ip, 20));
+        sample_put_be16(udp, (uint16_t)(10000u + (seq % 50000u)));
+    }
+    sample_put_be16(frame + header_off + 6, flags);
+    sample_put_be32(frame + header_off + 8, seq);
+    sample_put_be64(frame + header_off + 12, send_ns);
 }
 
 static int sample_bench_parse_frame(const struct raw_bench_opts *opts,
@@ -283,12 +345,14 @@ static int sample_bench_parse_frame(const struct raw_bench_opts *opts,
                                     uint16_t *flags) {
     uint16_t want_ethertype = 0;
     uint16_t version;
+    size_t header_off;
 
     if (opts == NULL || pkt == NULL || seq == NULL || send_ns == NULL ||
         flags == NULL) {
         return -1;
     }
-    if (pkt->len < 14 + MLXNICD_SAMPLE_BENCH_HDR_LEN) {
+    header_off = sample_bench_header_offset(opts);
+    if (pkt->len < header_off + MLXNICD_SAMPLE_BENCH_HDR_LEN) {
         return -1;
     }
     if (sample_parse_ethertype16(opts->ethertype, &want_ethertype) != 0) {
@@ -297,16 +361,16 @@ static int sample_bench_parse_frame(const struct raw_bench_opts *opts,
     if (sample_get_be16(pkt->data + 12) != want_ethertype) {
         return -1;
     }
-    if (sample_get_be32(pkt->data + 14) != MLXNICD_SAMPLE_BENCH_MAGIC) {
+    if (sample_get_be32(pkt->data + header_off) != MLXNICD_SAMPLE_BENCH_MAGIC) {
         return -1;
     }
-    version = sample_get_be16(pkt->data + 18);
+    version = sample_get_be16(pkt->data + header_off + 4);
     if (version != 1) {
         return -1;
     }
-    *flags = sample_get_be16(pkt->data + 20);
-    *seq = sample_get_be32(pkt->data + 22);
-    *send_ns = sample_get_be64(pkt->data + 26);
+    *flags = sample_get_be16(pkt->data + header_off + 6);
+    *seq = sample_get_be32(pkt->data + header_off + 8);
+    *send_ns = sample_get_be64(pkt->data + header_off + 12);
     return 0;
 }
 
@@ -340,22 +404,26 @@ static int sample_bench_slot_find(struct sample_bench_slot *slots,
                                   uint32_t slot_count, uint32_t seq) {
     uint32_t i;
 
-    for (i = 0; i < slot_count; i++) {
-        if (slots[i].active && slots[i].seq == seq) {
-            return (int)i;
-        }
+    if (slot_count == 0) {
+        return -1;
+    }
+    i = seq % slot_count;
+    if (slots[i].active && slots[i].seq == seq) {
+        return (int)i;
     }
     return -1;
 }
 
 static int sample_bench_slot_alloc(struct sample_bench_slot *slots,
-                                   uint32_t slot_count) {
+                                   uint32_t slot_count, uint32_t seq) {
     uint32_t i;
 
-    for (i = 0; i < slot_count; i++) {
-        if (!slots[i].active) {
-            return (int)i;
-        }
+    if (slot_count == 0) {
+        return -1;
+    }
+    i = seq % slot_count;
+    if (!slots[i].active) {
+        return (int)i;
     }
     return -1;
 }
@@ -804,9 +872,12 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
     struct sample_bench_slot slots[MLXNICD_SAMPLE_BENCH_MAX_WINDOW] = {{0}};
     struct sample_bench_stats stats = {0};
     uint8_t frame[MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+    uint8_t frame_template[MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+    uint32_t frame_template_len = 0;
     uint32_t sent = 0;
     uint32_t received = 0;
     uint32_t inflight = 0;
+    uint64_t throughput_start_ns = 0;
     int rc = -1;
 
     if (opts == NULL) {
@@ -816,6 +887,11 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
     if (opts->window > MLXNICD_SAMPLE_BENCH_MAX_WINDOW) {
         fprintf(stderr, "--window=%" PRIu32 " exceeds supported max=%u\n",
                 opts->window, MLXNICD_SAMPLE_BENCH_MAX_WINDOW);
+        return -1;
+    }
+    if (sample_bench_build_frame(opts, 0, 0, 0, frame_template,
+                                 sizeof(frame_template),
+                                 &frame_template_len) != 0) {
         return -1;
     }
 
@@ -844,16 +920,20 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
         sample_report_dev_error("mlxnicd_dev_start", dev);
         goto out;
     }
+    if (opts->throughput_only) {
+        throughput_start_ns = sample_now_ns();
+    }
 
     if (opts->window == 1) {
         while (sent < opts->packet_count) {
-            uint64_t send_ns = sample_now_ns();
+            uint64_t send_ns =
+                opts->throughput_only ? 0 : sample_now_ns();
             uint32_t frame_len = 0;
 
-            if (sample_bench_build_frame(opts, sent, send_ns, 0, frame,
-                                         sizeof(frame), &frame_len) != 0) {
-                goto out;
-            }
+            sample_bench_build_from_template(opts, frame_template,
+                                             frame_template_len, sent, send_ns,
+                                             0, frame);
+            frame_len = frame_template_len;
             tx_pkt.data = frame;
             tx_pkt.len = frame_len;
             if (mlxnicd_tx_burst(dev, &tx_pkt, 1) != 1) {
@@ -890,9 +970,9 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
 
                     (void)seq;
                     (void)pkt_send_ns;
-                    now_ns = sample_now_ns();
+                    now_ns = opts->throughput_only ? 0 : sample_now_ns();
                     rtt_ns = now_ns >= send_ns ? now_ns - send_ns : 0;
-                    if (rtt_ns < opts->min_rtt_ns) {
+                    if (!opts->throughput_only && rtt_ns < opts->min_rtt_ns) {
                         stats.local_frames++;
                     } else {
                         received++;
@@ -931,26 +1011,29 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
 
             while (batch < opts->window - inflight &&
                    sent + batch < opts->packet_count) {
-                int slot_index = sample_bench_slot_alloc(slots, opts->window);
+                int slot_index = sample_bench_slot_alloc(
+                    slots, opts->window, sent + batch);
 
                 if (slot_index < 0) {
-                    fprintf(stderr, "raw-bench: no free inflight slot\n");
-                    goto out;
+                    /* Replies can arrive out of order; wait for this cyclic
+                     * slot rather than scanning or overwriting another one. */
+                    break;
                 }
-                send_times[batch] = sample_now_ns();
-                if (sample_bench_build_frame(opts, sent + batch,
-                                             send_times[batch], 0,
-                                             tx_frames[batch],
-                                             sizeof(tx_frames[batch]),
-                                             &frame_lens[batch]) != 0) {
-                    goto out;
-                }
+                send_times[batch] =
+                    opts->throughput_only ? 0 : sample_now_ns();
+                sample_bench_build_from_template(
+                    opts, frame_template, frame_template_len, sent + batch,
+                    send_times[batch], 0, tx_frames[batch]);
+                frame_lens[batch] = frame_template_len;
                 tx_batch[batch].data = tx_frames[batch];
                 tx_batch[batch].len = frame_lens[batch];
                 slots[slot_index].seq = sent + batch;
                 slots[slot_index].send_ns = send_times[batch];
                 slots[slot_index].active = 1;
                 batch++;
+            }
+            if (batch == 0) {
+                break;
             }
             if (mlxnicd_tx_burst(dev, tx_batch, (uint16_t)batch) != batch) {
                 sample_report_dev_error("mlxnicd_tx_burst", dev);
@@ -977,39 +1060,43 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
         }
 
         {
+            struct mlxnicd_pkt rx_batch[MLXNICD_SAMPLE_BENCH_RX_BURST] = {{0}};
             int poll_timeout_ms =
                 (inflight >= opts->window || sent == opts->packet_count)
                     ? (int)opts->timeout_ms
                     : 0;
-            uint16_t got = mlxnicd_rx_burst(dev, &rx_pkt, 1, poll_timeout_ms);
+            uint16_t max_rx = inflight < MLXNICD_SAMPLE_BENCH_RX_BURST
+                                  ? (uint16_t)inflight
+                                  : MLXNICD_SAMPLE_BENCH_RX_BURST;
+            uint16_t got = mlxnicd_rx_burst(dev, rx_batch, max_rx,
+                                            poll_timeout_ms);
 
-            if (got != 1) {
+            if (got == 0) {
                 if (poll_timeout_ms == 0) {
                     continue;
                 }
                 sample_report_dev_error("mlxnicd_rx_burst", dev);
                 goto out;
             }
-        }
+            for (uint16_t i = 0; i < got; i++) {
+                uint32_t seq = 0;
+                uint64_t send_ns = 0;
+                uint16_t flags = 0;
+                uint64_t now_ns =
+                    opts->throughput_only ? 0 : sample_now_ns();
+                int slot_index;
 
-        {
-            uint32_t seq = 0;
-            uint64_t send_ns = 0;
-            uint16_t flags = 0;
-            uint64_t now_ns = sample_now_ns();
-            int slot_index;
-
-            if (sample_bench_parse_frame(opts, &rx_pkt, &seq, &send_ns,
-                                         &flags) != 0) {
-                stats.filtered_frames++;
-                if (opts->verbose) {
-                    fprintf(stdout,
-                            "raw-bench: filtered len=%" PRIu32 "\n",
-                            rx_pkt.len);
-                }
-            } else {
-                if ((flags & MLXNICD_SAMPLE_BENCH_F_REPLY) == 0 &&
-                    !sample_bench_is_l2_reflection(opts, &rx_pkt)) {
+                rx_pkt = rx_batch[i];
+                if (sample_bench_parse_frame(opts, &rx_pkt, &seq, &send_ns,
+                                             &flags) != 0) {
+                    stats.filtered_frames++;
+                    if (opts->verbose) {
+                        fprintf(stdout,
+                                "raw-bench: filtered len=%" PRIu32 "\n",
+                                rx_pkt.len);
+                    }
+                } else if ((flags & MLXNICD_SAMPLE_BENCH_F_REPLY) == 0 &&
+                           !sample_bench_is_l2_reflection(opts, &rx_pkt)) {
                     stats.local_frames++;
                     if (opts->verbose) {
                         fprintf(stdout,
@@ -1032,7 +1119,8 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
                                     " flags=0x%04" PRIx16 "\n",
                                     seq, rx_pkt.len, inflight, flags);
                         }
-                    } else if (now_ns < slots[slot_index].send_ns) {
+                    } else if (!opts->throughput_only &&
+                               now_ns < slots[slot_index].send_ns) {
                         stats.unmatched_frames++;
                         if (opts->verbose) {
                             fprintf(stdout,
@@ -1045,7 +1133,8 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
                     } else {
                         uint64_t rtt_ns = now_ns - slots[slot_index].send_ns;
 
-                        if (rtt_ns < opts->min_rtt_ns) {
+                        if (!opts->throughput_only &&
+                            rtt_ns < opts->min_rtt_ns) {
                             stats.local_frames++;
                             if (opts->verbose) {
                                 fprintf(stdout,
@@ -1063,7 +1152,9 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
                                 stats.rx_first_ns = now_ns;
                             }
                             stats.rx_last_ns = now_ns;
-                            sample_bench_stats_note_latency(&stats, rtt_ns);
+                            if (!opts->throughput_only) {
+                                sample_bench_stats_note_latency(&stats, rtt_ns);
+                            }
                             if (opts->verbose) {
                                 fprintf(stdout,
                                         "raw-bench: rx seq=%" PRIu32
@@ -1077,17 +1168,24 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
                     }
                 }
             }
-        }
-
-        if (mlxnicd_rx_release(dev, 1) != 0) {
-            sample_report_dev_error("mlxnicd_rx_release", dev);
-            goto out;
+            if (mlxnicd_rx_release(dev, got) != 0) {
+                sample_report_dev_error("mlxnicd_rx_release", dev);
+                goto out;
+            }
         }
     }
 
     rc = 0;
 
 out:
+    if (rc == 0 && opts->throughput_only) {
+        uint64_t end_ns = sample_now_ns();
+
+        stats.tx_first_ns = throughput_start_ns;
+        stats.tx_last_ns = end_ns;
+        stats.rx_first_ns = throughput_start_ns;
+        stats.rx_last_ns = end_ns;
+    }
     mlxnicd_dev_close(dev);
     if (rc == 0) {
         uint64_t tx_span_ns = stats.tx_last_ns > stats.tx_first_ns

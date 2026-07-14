@@ -336,6 +336,8 @@ int main(int argc, char **argv) {
         opts.window = window;
         opts.timeout_ms = timeout_ms;
         opts.min_rtt_ns = min_rtt_ns;
+        opts.rss_udp = opt_present(argc, argv, "--rss-udp");
+        opts.throughput_only = opt_present(argc, argv, "--throughput-only");
         opts.verbose = opt_present(argc, argv, "--verbose");
         return raw_bench_run(&opts) == 0 ? 0 : 1;
     }

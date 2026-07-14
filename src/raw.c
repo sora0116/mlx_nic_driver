@@ -2,6 +2,7 @@
 #include "sample.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static int missing(const char *name, const char *value) {
     if (value == NULL || value[0] == '\0') {
@@ -40,6 +41,11 @@ int raw_bench_run(const struct raw_bench_opts *opts) {
     }
     if (opts->window == 0) {
         fprintf(stderr, "--window must be greater than zero\n");
+        bad = 1;
+    }
+    if (opts->rss_udp && strcmp(opts->ethertype, "0x0800") != 0 &&
+        strcmp(opts->ethertype, "0x800") != 0) {
+        fprintf(stderr, "--rss-udp requires --ethertype 0x0800\n");
         bad = 1;
     }
     if (bad) {
