@@ -1,5 +1,6 @@
 #include "mlxnicd.h"
 #include "mlx5.h"
+#include "mlx5_priv.h"
 #include "vfio.h"
 
 #include <inttypes.h>
@@ -94,7 +95,6 @@ enum {
     MLX5_CMD_MBOX_SIZE = 1048576,
     MLX5_NIC_IFC_FULL_DRIVER = 0,
     MLX5_MANAGE_PAGES_GIVE = 1,
-    MLX5_MAX_FW_PAGES = 8192,
     MLX5_HCA_CAP_GENERAL = 0,
     MLX5_HCA_CAP_GET_MAX = 0,
     MLX5_HCA_CAP_GET_CUR = 1,
@@ -177,26 +177,6 @@ enum {
 
 #define MLX5_HW_START_PADDING UINT32_C(0x80000000)
 
-struct mlx5_fw_page {
-    void *addr;
-    uint64_t iova;
-};
-
-struct mlx5_cmd_ctx {
-    struct vfio_device dev;
-    void *cmdq;
-    void *inbox;
-    void *outbox;
-    uint64_t cmdq_iova;
-    uint64_t inbox_iova;
-    uint64_t outbox_iova;
-    uint32_t cmdq_h_orig;
-    uint32_t cmdq_l_sz_orig;
-    struct mlx5_fw_page fw_pages[MLX5_MAX_FW_PAGES];
-    size_t fw_page_count;
-    uint8_t token;
-};
-
 struct mlx5_dma_page {
     void *addr;
     uint64_t iova;
@@ -266,23 +246,6 @@ struct mlx5_rx_packet {
     uint16_t wqe_counter;
 };
 
-struct mlx5_rx_wait_stats {
-    uint32_t accepted;
-    uint32_t skipped_local;
-    uint32_t skipped_filtered;
-};
-
-struct mlx5_rx_filter {
-    int (*should_accept)(const struct mlx5_rx_packet *pkt, void *opaque);
-    int (*should_skip)(const struct mlx5_rx_packet *pkt, void *opaque);
-    void *opaque;
-};
-
-struct mlx5_rx_prefix_filter {
-    const uint8_t *prefix;
-    size_t prefix_len;
-};
-
 struct mlx5_test_runtime {
     struct mlx5_cmd_ctx ctx;
     uint32_t uar;
@@ -304,20 +267,6 @@ struct mlx5_test_runtime {
     struct mlx5_flow_group_res fg;
     struct mlx5_fte_res fte;
     uint8_t hca_cap[MLX5_HCA_CAP_SIZE];
-    uint8_t frame[MLX5_TX_TEST_MAX_INLINE_FRAME];
-    size_t frame_len;
-    size_t skip_frame_len;
-    int tx_done;
-};
-
-struct mlx5_run_profile {
-    const char *banner;
-    int do_tx;
-    int create_rx_objects;
-    int post_rx;
-    int create_rx_flow_table;
-    int wait_rx;
-    int skip_local_tx_on_rx;
 };
 
 struct mlxnicd_dev {
@@ -327,19 +276,37 @@ struct mlxnicd_dev {
     int started;
     int last_error;
     int quiet_saved;
+    uint16_t rx_outstanding;
 };
 
-static int mlx5_rx_should_skip_prefix(const struct mlx5_rx_packet *pkt,
-                                      void *opaque) {
-    const struct mlx5_rx_prefix_filter *filter = opaque;
+static int mlxnicd_err_from_rc(int rc) {
+    return rc == 0 ? MLXNICD_OK : MLXNICD_ERR_IO;
+}
 
-    if (pkt == NULL || filter == NULL || filter->prefix == NULL) {
-        return 0;
+static int mlxnicd_set_error(struct mlxnicd_dev *dev, int err) {
+    if (dev != NULL) {
+        dev->last_error = err;
     }
-    if (pkt->len < filter->prefix_len) {
-        return 0;
+    return err;
+}
+
+const char *mlxnicd_strerror(int err) {
+    switch (err) {
+    case MLXNICD_OK:
+        return "ok";
+    case MLXNICD_ERR_INVAL:
+        return "invalid argument";
+    case MLXNICD_ERR_STATE:
+        return "invalid state";
+    case MLXNICD_ERR_IO:
+        return "device I/O error";
+    case MLXNICD_ERR_TIMEOUT:
+        return "timeout";
+    case MLXNICD_ERR_UNSUPPORTED:
+        return "unsupported";
+    default:
+        return "unknown error";
     }
-    return memcmp(pkt->data, filter->prefix, filter->prefix_len) == 0;
 }
 
 static void mlx5_dump_cq_slots(struct mlx5_cq_res *cq, uint32_t first,
@@ -505,7 +472,7 @@ static void mlx5_dma_page_free(struct mlx5_cmd_ctx *ctx,
     memset(page, 0, sizeof(*page));
 }
 
-static void mlx5_cmd_ctx_close(struct mlx5_cmd_ctx *ctx) {
+void mlx5_cmd_ctx_close(struct mlx5_cmd_ctx *ctx) {
     if (ctx->dev.bar0 != NULL) {
         mmio_write32_be(ctx->dev.bar0, MLX5_INIT_CMDQ_ADDR_H, ctx->cmdq_h_orig);
         mmio_write32_be(ctx->dev.bar0, MLX5_INIT_CMDQ_ADDR_L_SZ,
@@ -534,7 +501,7 @@ static void mlx5_cmd_ctx_close(struct mlx5_cmd_ctx *ctx) {
     vfio_device_close(&ctx->dev);
 }
 
-static int mlx5_cmd_ctx_open(const char *bdf, struct mlx5_cmd_ctx *ctx) {
+int mlx5_cmd_ctx_open(const char *bdf, struct mlx5_cmd_ctx *ctx) {
     uint32_t cmdif;
     unsigned int cmdif_rev;
 
@@ -751,136 +718,22 @@ static int mlx5_cmd_exec(struct mlx5_cmd_ctx *ctx, uint16_t opcode,
     return 0;
 }
 
-int mlx5_info(const char *bdf) {
-    struct vfio_device dev;
-    int rc = vfio_device_open(bdf, &dev);
-    if (rc != 0) {
-        return rc;
-    }
-    uint32_t fw_rev = mmio_read32_be(dev.bar0, MLX5_INIT_FW_REV);
-    uint32_t cmdif = mmio_read32_be(dev.bar0, MLX5_INIT_CMDIF_REV_FW_SUB);
-    uint32_t cmdq_h = mmio_read32_be(dev.bar0, MLX5_INIT_CMDQ_ADDR_H);
-    uint32_t cmdq_l_sz = mmio_read32_be(dev.bar0, MLX5_INIT_CMDQ_ADDR_L_SZ);
-    uint32_t initializing = mmio_read32_be(dev.bar0, MLX5_INIT_INITIALIZING);
-    uint32_t health_counter = mmio_read32_be(dev.bar0, MLX5_INIT_HEALTH_COUNTER);
-
-    printf("mlx5-info ok\n");
-    printf("  bdf: %s\n", bdf);
-    printf("  BAR0 size: 0x%" PRIx64 "\n", dev.bar0_size);
-    printf("  fw_rev raw: 0x%08" PRIx32 "\n", fw_rev);
-    printf("  cmdif_rev_fw_sub raw: 0x%08" PRIx32 "\n", cmdif);
-    printf("  cmdif_rev: %u\n", cmdif >> 16);
-    printf("  fw_sub: %u\n", cmdif & 0xffff);
-    printf("  cmdq_addr_h: 0x%08" PRIx32 "\n", cmdq_h);
-    printf("  cmdq_addr_l_sz: 0x%08" PRIx32 "\n", cmdq_l_sz);
-    printf("  log_cmdq_size: %u\n", cmdq_log_size(cmdq_l_sz));
-    printf("  log_cmdq_stride: %u\n", cmdq_log_stride(cmdq_l_sz));
-    printf("  nic_interface: %u\n", cmdq_nic_interface(cmdq_l_sz));
-    printf("  cmd_dbell raw: 0x%08" PRIx32 "\n",
-           mmio_read32_be(dev.bar0, MLX5_INIT_CMD_DBELL));
-    printf("  initializing raw: 0x%08" PRIx32 "\n", initializing);
-    printf("  initializing bit31: %u\n", initializing >> 31);
-    printf("  health_counter: %" PRIu32 "\n", health_counter);
-    print_cmdq_fields("cmdq decoded", cmdq_h, cmdq_l_sz);
-    vfio_device_close(&dev);
-    return 0;
-}
-
-int mlx5_query_issi(const char *bdf) {
-    struct mlx5_cmd_ctx ctx;
+int mlx5_ctx_query_issi(struct mlx5_cmd_ctx *ctx) {
     uint8_t in[16] = {0};
     uint8_t out[128] = {0};
+
     put_be16(in, MLX5_CMD_OP_QUERY_ISSI);
-    if (mlx5_cmd_ctx_open(bdf, &ctx) != 0) {
-        return -1;
-    }
-    int rc = mlx5_cmd_exec(&ctx, MLX5_CMD_OP_QUERY_ISSI, in, sizeof(in), out,
+    int rc = mlx5_cmd_exec(ctx, MLX5_CMD_OP_QUERY_ISSI, in, sizeof(in), out,
                            sizeof(out), "mlx5-query-issi");
     if (rc == 0) {
         printf("  out.current_issi: %u\n", (unsigned)get_be16(out + 10));
         printf("  out.supported_issi_dw0: 0x%08" PRIx32 "\n",
                get_be32(out + 108));
     }
-    mlx5_cmd_ctx_close(&ctx);
     return rc;
 }
 
-int mlx5_set_issi(const char *bdf) {
-    struct mlx5_cmd_ctx ctx;
-    uint8_t in[32] = {0};
-    uint8_t out[16] = {0};
-    put_be16(in, MLX5_CMD_OP_SET_ISSI);
-    put_be16(in + 0x0a, 1);
-    if (mlx5_cmd_ctx_open(bdf, &ctx) != 0) {
-        return -1;
-    }
-    int rc = mlx5_cmd_exec(&ctx, MLX5_CMD_OP_SET_ISSI, in, sizeof(in), out,
-                           sizeof(out), "mlx5-set-issi");
-    mlx5_cmd_ctx_close(&ctx);
-    return rc;
-}
-
-int mlx5_enable_hca(const char *bdf) {
-    struct mlx5_cmd_ctx ctx;
-    uint8_t in[32] = {0};
-    uint8_t out[16] = {0};
-    put_be16(in, MLX5_CMD_OP_ENABLE_HCA);
-    if (mlx5_cmd_ctx_open(bdf, &ctx) != 0) {
-        return -1;
-    }
-    int rc = mlx5_cmd_exec(&ctx, MLX5_CMD_OP_ENABLE_HCA, in, sizeof(in), out,
-                           sizeof(out), "mlx5-enable-hca");
-    mlx5_cmd_ctx_close(&ctx);
-    return rc;
-}
-
-int mlx5_query_pages(const char *bdf, int boot) {
-    struct mlx5_cmd_ctx ctx;
-    uint8_t in[32] = {0};
-    uint8_t out[32] = {0};
-    int rc;
-
-    put_be16(in, MLX5_CMD_OP_QUERY_PAGES);
-    put_be16(in + 0x06, boot ? 1 : 2);
-    if (mlx5_cmd_ctx_open(bdf, &ctx) != 0) {
-        return -1;
-    }
-    rc = mlx5_cmd_exec(&ctx, MLX5_CMD_OP_QUERY_PAGES, in, sizeof(in), out,
-                       sizeof(out), boot ? "mlx5-query-boot-pages"
-                                         : "mlx5-query-init-pages");
-    if (rc == 0) {
-        printf("  function_id: 0x%04x\n", get_be16(out + 0x0a));
-        printf("  num_pages: %" PRIu32 "\n", get_be32(out + 0x0c));
-    }
-    mlx5_cmd_ctx_close(&ctx);
-    return rc;
-}
-
-int mlx5_query_hca_cap(const char *bdf) {
-    struct mlx5_cmd_ctx ctx;
-    uint8_t in[16] = {0};
-    uint8_t out[4112] = {0};
-    int rc;
-
-    put_be16(in, MLX5_CMD_OP_QUERY_HCA_CAP);
-    put_be16(in + 0x06, 1);
-    if (mlx5_cmd_ctx_open(bdf, &ctx) != 0) {
-        return -1;
-    }
-    rc = mlx5_cmd_exec(&ctx, MLX5_CMD_OP_QUERY_HCA_CAP, in, sizeof(in), out,
-                       sizeof(out), "mlx5-query-hca-cap");
-    if (rc == 0) {
-        printf("  cap.raw[0x10..0x50]:");
-        for (size_t i = 0x10; i < 0x50; i += 4) {
-            printf(" %08" PRIx32, get_be32(out + i));
-        }
-        printf("\n");
-    }
-    mlx5_cmd_ctx_close(&ctx);
-    return rc;
-}
-
-static int mlx5_ctx_enable_hca(struct mlx5_cmd_ctx *ctx) {
+int mlx5_ctx_enable_hca(struct mlx5_cmd_ctx *ctx) {
     uint8_t in[32] = {0};
     uint8_t out[16] = {0};
 
@@ -889,7 +742,7 @@ static int mlx5_ctx_enable_hca(struct mlx5_cmd_ctx *ctx) {
                          sizeof(out), "seq-enable-hca");
 }
 
-static int mlx5_ctx_set_issi(struct mlx5_cmd_ctx *ctx) {
+int mlx5_ctx_set_issi(struct mlx5_cmd_ctx *ctx) {
     uint8_t in[32] = {0};
     uint8_t out[16] = {0};
 
@@ -899,7 +752,7 @@ static int mlx5_ctx_set_issi(struct mlx5_cmd_ctx *ctx) {
                          sizeof(out), "seq-set-issi");
 }
 
-static int mlx5_ctx_query_pages(struct mlx5_cmd_ctx *ctx, int boot) {
+int mlx5_ctx_query_pages(struct mlx5_cmd_ctx *ctx, int boot) {
     uint8_t in[32] = {0};
     uint8_t out[32] = {0};
     int rc;
@@ -1021,8 +874,9 @@ static int mlx5_ctx_query_paos(struct mlx5_cmd_ctx *ctx, uint8_t local_port) {
     return rc;
 }
 
-static int mlx5_ctx_query_ppcnt_802_3(struct mlx5_cmd_ctx *ctx,
-                                      uint8_t local_port, const char *tag) {
+static __attribute__((unused)) int
+mlx5_ctx_query_ppcnt_802_3(struct mlx5_cmd_ctx *ctx, uint8_t local_port,
+                           const char *tag) {
     uint8_t in[16 + MLX5_PPCNT_REG_SIZE] = {0};
     uint8_t out[16 + MLX5_PPCNT_REG_SIZE] = {0};
     uint8_t *reg = in + 16;
@@ -1702,9 +1556,9 @@ static int mlx5_ctx_destroy_rqt(struct mlx5_cmd_ctx *ctx,
     return rc;
 }
 
-static int mlx5_ctx_query_rqt(struct mlx5_cmd_ctx *ctx,
-                              const struct mlx5_rqt_res *rqt,
-                              const char *tag) {
+static __attribute__((unused)) int
+mlx5_ctx_query_rqt(struct mlx5_cmd_ctx *ctx, const struct mlx5_rqt_res *rqt,
+                   const char *tag) {
     uint8_t in[16] = {0};
     uint8_t out[MLX5_QUERY_RQT_OUT_SIZE] = {0};
     uint8_t *rqtc = out + MLX5_QUERY_RQT_RQTC_OFF;
@@ -1730,9 +1584,10 @@ static int mlx5_ctx_query_rqt(struct mlx5_cmd_ctx *ctx,
     return rc;
 }
 
-static int mlx5_ctx_create_direct_tir(struct mlx5_cmd_ctx *ctx, uint32_t tdn,
-                                      const struct mlx5_rq_res *rq,
-                                      struct mlx5_tir_res *tir) {
+static __attribute__((unused)) int
+mlx5_ctx_create_direct_tir(struct mlx5_cmd_ctx *ctx, uint32_t tdn,
+                           const struct mlx5_rq_res *rq,
+                           struct mlx5_tir_res *tir) {
     uint8_t in[MLX5_CREATE_TIR_IN_SIZE] = {0};
     uint8_t out[16] = {0};
     uint8_t *tirc = in + MLX5_CREATE_TIR_TIRC_OFF;
@@ -1815,9 +1670,9 @@ static int mlx5_ctx_destroy_tir(struct mlx5_cmd_ctx *ctx,
     return rc;
 }
 
-static int mlx5_ctx_query_tir(struct mlx5_cmd_ctx *ctx,
-                              const struct mlx5_tir_res *tir,
-                              const char *tag) {
+static __attribute__((unused)) int
+mlx5_ctx_query_tir(struct mlx5_cmd_ctx *ctx, const struct mlx5_tir_res *tir,
+                   const char *tag) {
     uint8_t in[16] = {0};
     uint8_t out[MLX5_QUERY_TIR_OUT_SIZE] = {0};
     uint8_t *tirc = out + MLX5_QUERY_TIR_TIRC_OFF;
@@ -2067,8 +1922,9 @@ static int mlx5_ctx_modify_sq_ready(struct mlx5_cmd_ctx *ctx,
                          sizeof(out), "seq-modify-sq-rdy");
 }
 
-static int mlx5_ctx_query_sq(struct mlx5_cmd_ctx *ctx,
-                             const struct mlx5_sq_res *sq, const char *tag) {
+static __attribute__((unused)) int
+mlx5_ctx_query_sq(struct mlx5_cmd_ctx *ctx, const struct mlx5_sq_res *sq,
+                  const char *tag) {
     uint8_t in[16] = {0};
     uint8_t out[MLX5_QUERY_SQ_OUT_SIZE] = {0};
     uint8_t *sqc = out + MLX5_QUERY_SQ_SQC_OFF;
@@ -2095,8 +1951,9 @@ static int mlx5_ctx_query_sq(struct mlx5_cmd_ctx *ctx,
     return rc;
 }
 
-static int mlx5_ctx_query_rq(struct mlx5_cmd_ctx *ctx,
-                             const struct mlx5_rq_res *rq, const char *tag) {
+static __attribute__((unused)) int
+mlx5_ctx_query_rq(struct mlx5_cmd_ctx *ctx, const struct mlx5_rq_res *rq,
+                  const char *tag) {
     uint8_t in[16] = {0};
     uint8_t out[MLX5_QUERY_RQ_OUT_SIZE] = {0};
     uint8_t *rqc = out + MLX5_QUERY_RQ_RQC_OFF;
@@ -2250,90 +2107,9 @@ static int mlx5_rx_replenish_one(struct mlx5_cmd_ctx *ctx,
     return 0;
 }
 
-static int mlx5_wait_for_rx_packets(struct mlx5_cmd_ctx *ctx,
-                                    struct mlx5_cq_res *cq,
-                                    struct mlx5_rq_res *rq, uint32_t mkey,
-                                    uint32_t count, int timeout_ms,
-                                    const struct mlx5_rx_filter *filter,
-                                    struct mlx5_rx_wait_stats *stats) {
-
-    if (!rq->valid) {
-        fprintf(stderr, "cannot wait for RX without posted RX buffer\n");
-        return -1;
-    }
-    if (stats != NULL) {
-        memset(stats, 0, sizeof(*stats));
-    }
-
-    for (uint32_t i = 0; i < count;) {
-        int rc;
-        size_t dump_len;
-        struct mlx5_rx_packet pkt;
-
-        printf("  wait for RX CQE: packet=%" PRIu32 "/%" PRIu32
-               " timeout_ms=%d\n",
-               i + 1, count, timeout_ms);
-        rc = mlx5_rx_poll_one(cq, rq, timeout_ms, &pkt);
-        if (rc != 0) {
-            mlx5_dump_cq_slots(cq, cq->cons_index, 3, "seq-rx-timeout");
-            if (rq->rx_pages[0].addr != NULL) {
-                dump_hex("  rx buffer[0] after timeout", rq->rx_pages[0].addr,
-                         128);
-            }
-            return rc;
-        }
-
-        printf("  rx frame length: %" PRIu32 "\n", pkt.len);
-        printf("  rx buffer slot: %" PRIu32 "\n", pkt.slot);
-        dump_len = pkt.len;
-        if (dump_len > MLX5_RX_BUFFER_SIZE) {
-            dump_len = MLX5_RX_BUFFER_SIZE;
-        }
-        if (dump_len < 64) {
-            dump_len = 64;
-        }
-        dump_hex("  rx frame", pkt.data, dump_len);
-
-        if (filter != NULL && filter->should_accept != NULL &&
-            !filter->should_accept(&pkt, filter->opaque)) {
-            printf("  rx frame did not match RX accept filter; skipped\n");
-            if (stats != NULL) {
-                stats->skipped_filtered++;
-            }
-            rc = mlx5_rx_replenish_one(ctx, rq, mkey);
-            if (rc != 0) {
-                return rc;
-            }
-            continue;
-        }
-
-        if (filter != NULL && filter->should_skip != NULL &&
-            filter->should_skip(&pkt, filter->opaque)) {
-            printf("  rx frame matched RX skip filter; skipped\n");
-            if (stats != NULL) {
-                stats->skipped_local++;
-            }
-            rc = mlx5_rx_replenish_one(ctx, rq, mkey);
-            if (rc != 0) {
-                return rc;
-            }
-            continue;
-        }
-
-        rc = mlx5_rx_replenish_one(ctx, rq, mkey);
-        if (rc != 0) {
-            return rc;
-        }
-        if (stats != NULL) {
-            stats->accepted++;
-        }
-        i++;
-    }
-    return 0;
-}
-
-static void mlx5_dump_cq_slots(struct mlx5_cq_res *cq, uint32_t first,
-                               uint32_t count, const char *tag) {
+static __attribute__((unused)) void
+mlx5_dump_cq_slots(struct mlx5_cq_res *cq, uint32_t first, uint32_t count,
+                   const char *tag) {
     printf("%s CQ slots dump\n", tag);
     for (uint32_t i = 0; i < count; i++) {
         uint32_t ix = (first + i) & (MLX5_CQ_CQE_COUNT - 1);
@@ -2343,9 +2119,10 @@ static void mlx5_dump_cq_slots(struct mlx5_cq_res *cq, uint32_t first,
     }
 }
 
-static int mlx5_sq_post_nop_tag(struct mlx5_cmd_ctx *ctx, uint32_t uar,
-                                struct mlx5_cq_res *cq,
-                                struct mlx5_sq_res *sq, const char *tag) {
+static __attribute__((unused)) int
+mlx5_sq_post_nop_tag(struct mlx5_cmd_ctx *ctx, uint32_t uar,
+                     struct mlx5_cq_res *cq, struct mlx5_sq_res *sq,
+                     const char *tag) {
     uint8_t *wqe = (uint8_t *)sq->sq_page.addr +
                    ((sq->prod_index & (MLX5_SQ_WQE_COUNT - 1)) <<
                     MLX5_SEND_WQE_BB_LOG);
@@ -2540,8 +2317,8 @@ static int build_tx_test_frame(const struct mlx5_tx_test_opts *opts,
     return 0;
 }
 
-static size_t trim_trailing_zero_bytes(const uint8_t *buf, size_t len,
-                                       size_t min_len) {
+static __attribute__((unused)) size_t
+trim_trailing_zero_bytes(const uint8_t *buf, size_t len, size_t min_len) {
     while (len > min_len && buf[len - 1] == 0x00) {
         len--;
     }
@@ -2629,75 +2406,8 @@ static int mlx5_ctx_set_hca_cap_raw(struct mlx5_cmd_ctx *ctx, uint16_t cap_type,
                          out, sizeof(out), "seq-set-hca-cap-general");
 }
 
-static int mlx5_post_tx_frames(struct mlx5_cmd_ctx *ctx, uint32_t uar,
-                               uint32_t tisn, uint32_t mkey,
-                               struct mlx5_cq_res *cq,
-                               struct mlx5_sq_res *sq, const uint8_t *frame,
-                               size_t frame_len, unsigned int count) {
-    printf("  post full-inline SEND WQE(s): count=%u\n", count);
-    for (unsigned int i = 0; i < count; i++) {
-        int rc;
-
-        printf("  tx-test iteration: %u/%u\n", i + 1, count);
-        rc = mlx5_sq_post_send_raw(ctx, uar, tisn, mkey, cq, sq, frame,
-                                   frame_len);
-        if (rc != 0) {
-            mlx5_dump_cq_slots(cq, cq->cons_index, 3,
-                               "seq-after-send-timeout");
-            (void)mlx5_ctx_query_sq(ctx, sq, "seq-query-sq-after-send");
-            (void)mlx5_sq_post_nop_tag(ctx, uar, cq, sq,
-                                       "seq-post-nop-after-send");
-            mlx5_dump_cq_slots(cq, cq->cons_index, 3,
-                               "seq-after-nop-timeout");
-            (void)mlx5_ctx_query_sq(ctx, sq, "seq-query-sq-after-nop");
-            return rc;
-        }
-    }
-    return 0;
-}
-
 static void mlx5_test_runtime_init(struct mlx5_test_runtime *rt) {
     memset(rt, 0, sizeof(*rt));
-}
-
-static int mlx5_test_runtime_post_tx(struct mlx5_test_runtime *rt,
-                                     unsigned int count) {
-    int rc = mlx5_post_tx_frames(&rt->ctx, rt->uar, rt->tisn, rt->mkey, &rt->cq,
-                                 &rt->sq, rt->frame, rt->frame_len, count);
-    if (rc == 0) {
-        rt->tx_done = 1;
-    }
-    return rc;
-}
-
-static int mlx5_test_runtime_wait_rx(struct mlx5_test_runtime *rt,
-                                     uint32_t count, int timeout_ms,
-                                     int pre_delay_ms,
-                                     const struct mlx5_rx_filter *rx_filter,
-                                     const char *skip_local_tx_prefix,
-                                     struct mlx5_rx_wait_stats *stats) {
-    struct mlx5_rx_prefix_filter prefix_filter = {0};
-    struct mlx5_rx_filter filter = {0};
-
-    (void)skip_local_tx_prefix;
-    (void)mlx5_ctx_query_ppcnt_802_3(&rt->ctx, 1, "seq-query-ppcnt-before-rx");
-    if (pre_delay_ms > 0) {
-        printf("  RX armed; sleeping %d ms before RX poll\n", pre_delay_ms);
-        sleep_ms(pre_delay_ms);
-    }
-    if (rx_filter != NULL) {
-        filter = *rx_filter;
-    }
-    if (skip_local_tx_prefix != NULL) {
-        prefix_filter.prefix = rt->frame;
-        prefix_filter.prefix_len = rt->skip_frame_len;
-        filter.should_skip = mlx5_rx_should_skip_prefix;
-        filter.opaque = &prefix_filter;
-    }
-    return mlx5_wait_for_rx_packets(&rt->ctx, &rt->cq, &rt->rq, rt->mkey, count,
-                                    timeout_ms,
-                                    filter.should_skip != NULL ? &filter : NULL,
-                                    stats);
 }
 
 static void mlx5_test_runtime_cleanup(struct mlx5_test_runtime *rt, int *rc_io) {
@@ -2840,25 +2550,30 @@ int mlxnicd_dev_configure(struct mlxnicd_dev *dev,
                           const struct mlxnicd_dev_config *config) {
     if (dev == NULL || config == NULL) {
         fprintf(stderr, "mlxnicd_dev_configure requires device and config\n");
+        mlxnicd_set_error(dev, MLXNICD_ERR_INVAL);
         return -1;
     }
     if (dev->started) {
         fprintf(stderr, "cannot configure a started mlxnicd device\n");
+        mlxnicd_set_error(dev, MLXNICD_ERR_STATE);
         return -1;
     }
     if ((config->flags & (MLXNICD_DEV_F_TX | MLXNICD_DEV_F_RX)) == 0) {
         fprintf(stderr, "mlxnicd device must enable TX and/or RX\n");
+        mlxnicd_set_error(dev, MLXNICD_ERR_INVAL);
         return -1;
     }
     if (config->rx_post_count > MLX5_RQ_WQE_COUNT) {
         fprintf(stderr, "rx_post_count=%" PRIu32 " exceeds max=%u\n",
                 config->rx_post_count, MLX5_RQ_WQE_COUNT);
+        mlxnicd_set_error(dev, MLXNICD_ERR_INVAL);
         return -1;
     }
     dev->config = *config;
     if (dev->config.rx_post_count == 0) {
         dev->config.rx_post_count = MLX5_RX_TEST_POST_COUNT;
     }
+    dev->last_error = MLXNICD_OK;
     return 0;
 }
 
@@ -2870,8 +2585,9 @@ void mlxnicd_dev_stop(struct mlxnicd_dev *dev) {
     }
     if (dev->started) {
         mlx5_test_runtime_cleanup(&dev->rt, &rc);
-        dev->last_error = rc;
+        dev->last_error = mlxnicd_err_from_rc(rc);
         dev->started = 0;
+        dev->rx_outstanding = 0;
         g_mlx5_stdout_quiet = dev->quiet_saved;
         vfio_set_stdout_quiet(0);
         mlx5_test_runtime_init(&dev->rt);
@@ -2887,7 +2603,7 @@ void mlxnicd_dev_close(struct mlxnicd_dev *dev) {
 }
 
 int mlxnicd_dev_last_error(const struct mlxnicd_dev *dev) {
-    return dev != NULL ? dev->last_error : -1;
+    return dev != NULL ? dev->last_error : MLXNICD_ERR_INVAL;
 }
 
 int mlxnicd_frame_build(const struct mlxnicd_l2_frame_spec *spec,
@@ -2924,6 +2640,7 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
         return -1;
     }
     if (dev->started) {
+        dev->last_error = MLXNICD_OK;
         return 0;
     }
 
@@ -2936,7 +2653,7 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
     vfio_set_stdout_quiet(dev->config.log_verbose ? 0 : 1);
 
     if (mlx5_cmd_ctx_open(dev->bdf, &rt->ctx) != 0) {
-        dev->last_error = -1;
+        dev->last_error = MLXNICD_ERR_IO;
         g_mlx5_stdout_quiet = dev->quiet_saved;
         vfio_set_stdout_quiet(0);
         return -1;
@@ -3118,13 +2835,15 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
         }
     }
 
-    dev->last_error = 0;
+    dev->last_error = MLXNICD_OK;
     dev->started = 1;
+    dev->rx_outstanding = 0;
     return 0;
 
 out:
     mlx5_test_runtime_cleanup(rt, &rc);
-    dev->last_error = rc;
+    dev->last_error = mlxnicd_err_from_rc(rc);
+    dev->rx_outstanding = 0;
     g_mlx5_stdout_quiet = dev->quiet_saved;
     vfio_set_stdout_quiet(0);
     return -1;
@@ -3138,7 +2857,7 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
         return 0;
     }
     if (!dev->started || (dev->config.flags & MLXNICD_DEV_F_TX) == 0) {
-        dev->last_error = -1;
+        dev->last_error = MLXNICD_ERR_STATE;
         return 0;
     }
 
@@ -3147,13 +2866,13 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
                                        dev->rt.mkey, &dev->rt.cq, &dev->rt.sq,
                                        pkts[sent].data, pkts[sent].len);
         if (rc != 0) {
-            dev->last_error = rc;
+            dev->last_error = mlxnicd_err_from_rc(rc);
             break;
         }
         sent++;
     }
     if (sent == nb_pkts) {
-        dev->last_error = 0;
+        dev->last_error = MLXNICD_OK;
     }
     return sent;
 }
@@ -3171,7 +2890,7 @@ uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
         return 0;
     }
     if (!dev->started || (dev->config.flags & MLXNICD_DEV_F_RX) == 0) {
-        dev->last_error = -1;
+        dev->last_error = MLXNICD_ERR_STATE;
         return 0;
     }
 
@@ -3181,7 +2900,7 @@ uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
 
         if (rc != 0) {
             if (received == 0) {
-                dev->last_error = 0;
+                dev->last_error = MLXNICD_ERR_TIMEOUT;
             }
             break;
         }
@@ -3190,7 +2909,9 @@ uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
         received++;
     }
     if (received > 0) {
-        dev->last_error = 0;
+        dev->last_error = MLXNICD_OK;
+        dev->rx_outstanding =
+            (uint16_t)(dev->rx_outstanding + received);
     }
     return received;
 }
@@ -3202,314 +2923,36 @@ int mlxnicd_rx_release(struct mlxnicd_dev *dev, uint16_t nb_pkts) {
         return -1;
     }
     if (!dev->started || (dev->config.flags & MLXNICD_DEV_F_RX) == 0) {
-        dev->last_error = -1;
+        dev->last_error = MLXNICD_ERR_STATE;
+        return -1;
+    }
+    if (nb_pkts > dev->rx_outstanding) {
+        dev->last_error = MLXNICD_ERR_INVAL;
         return -1;
     }
     for (i = 0; i < nb_pkts; i++) {
         int rc = mlx5_rx_replenish_one(&dev->rt.ctx, &dev->rt.rq, dev->rt.mkey);
         if (rc != 0) {
-            dev->last_error = rc;
+            dev->last_error = mlxnicd_err_from_rc(rc);
             return -1;
         }
     }
-    dev->last_error = 0;
+    dev->rx_outstanding = (uint16_t)(dev->rx_outstanding - nb_pkts);
+    dev->last_error = MLXNICD_OK;
     return 0;
 }
+int mlx5_ctx_query_hca_cap(struct mlx5_cmd_ctx *ctx) {
+    uint8_t cap[MLX5_HCA_CAP_OUT_SIZE] = {0};
+    int rc = mlx5_ctx_query_hca_cap_raw(
+        ctx, (MLX5_HCA_CAP_GENERAL << 1) | MLX5_HCA_CAP_GET_CUR, cap,
+        MLX5_HCA_CAP_SIZE, "mlx5-query-hca-cap");
 
-static int mlx5_run_profile(const char *bdf,
-                            const struct mlx5_tx_test_opts *opts,
-                            const struct mlx5_run_profile *profile,
-                            uint32_t rx_wait_count, int rx_pre_delay_ms,
-                            int rx_timeout_ms,
-                            struct mlx5_rx_wait_stats *rx_stats) {
-    struct mlx5_test_runtime rt;
-    int rc = 0;
-    unsigned int count = opts != NULL && opts->count != 0 ? opts->count : 1;
-    uint16_t function_id;
-    uint32_t num_pages;
-    const char *banner = profile != NULL ? profile->banner : "mlx5-run";
-    int do_tx = profile != NULL ? profile->do_tx : 0;
-    int create_rx_objects = profile != NULL ? profile->create_rx_objects : 0;
-    int post_rx = profile != NULL ? profile->post_rx : 0;
-    int create_rx_flow_table =
-        profile != NULL ? profile->create_rx_flow_table : 0;
-    int wait_rx = profile != NULL ? profile->wait_rx : 0;
-    int skip_local_tx_on_rx =
-        profile != NULL ? profile->skip_local_tx_on_rx : 0;
-
-    mlx5_test_runtime_init(&rt);
-    if (do_tx &&
-        build_tx_test_frame(opts, rt.frame, sizeof(rt.frame), &rt.frame_len) != 0) {
-        return -1;
-    }
-    if (skip_local_tx_on_rx && do_tx) {
-        rt.skip_frame_len = trim_trailing_zero_bytes(rt.frame, rt.frame_len, 14);
-    }
-    if (mlx5_cmd_ctx_open(bdf, &rt.ctx) != 0) {
-        return -1;
-    }
-
-    printf("%s: persistent command context\n", banner);
-    printf("  tx frame length: %zu\n", rt.frame_len);
-    rc = mlx5_ctx_enable_hca(&rt.ctx);
-    if (rc != 0) {
-        goto out;
-    }
-    rc = mlx5_ctx_set_issi(&rt.ctx);
-    if (rc != 0) {
-        goto out;
-    }
-    rc = mlx5_ctx_query_pages(&rt.ctx, 1);
-    if (rc != 0) {
-        goto out;
-    }
-    {
-        uint8_t in[32] = {0};
-        uint8_t out[32] = {0};
-
-        put_be16(in, MLX5_CMD_OP_QUERY_PAGES);
-        put_be16(in + 0x06, 1);
-        rc = mlx5_cmd_exec(&rt.ctx, MLX5_CMD_OP_QUERY_PAGES, in, sizeof(in), out,
-                           sizeof(out), "seq-query-boot-pages-for-give");
-        if (rc != 0) {
-            goto out;
+    if (rc == 0) {
+        printf("  cap.raw[0x00..0x40]:");
+        for (size_t i = 0; i < 0x40; i += 4) {
+            printf(" %08" PRIx32, get_be32(cap + i));
         }
-        function_id = get_be16(out + 0x0a);
-        num_pages = get_be32(out + 0x0c);
-        rc = mlx5_ctx_give_pages(&rt.ctx, function_id, num_pages,
-                                 "seq-give-boot-pages");
-        if (rc != 0) {
-            goto out;
-        }
+        printf("\n");
     }
-    rc = mlx5_ctx_query_dtor(&rt.ctx);
-    if (rc != 0) {
-        goto out;
-    }
-    rc = mlx5_ctx_query_hca_cap_raw(
-        &rt.ctx, (MLX5_HCA_CAP_GENERAL << 1) | MLX5_HCA_CAP_GET_CUR, rt.hca_cap,
-        sizeof(rt.hca_cap), "seq-query-hca-cap-general-current");
-    if (rc != 0) {
-        goto out;
-    }
-    rc = mlx5_ctx_set_hca_cap_raw(&rt.ctx, MLX5_HCA_CAP_GENERAL, rt.hca_cap,
-                                  sizeof(rt.hca_cap));
-    if (rc != 0) {
-        goto out;
-    }
-    rc = mlx5_ctx_query_pages(&rt.ctx, 0);
-    if (rc != 0) {
-        goto out;
-    }
-    {
-        uint8_t in[32] = {0};
-        uint8_t out[32] = {0};
-
-        put_be16(in, MLX5_CMD_OP_QUERY_PAGES);
-        put_be16(in + 0x06, 2);
-        rc = mlx5_cmd_exec(&rt.ctx, MLX5_CMD_OP_QUERY_PAGES, in, sizeof(in), out,
-                           sizeof(out), "seq-query-init-pages-for-give");
-        if (rc != 0) {
-            goto out;
-        }
-        function_id = get_be16(out + 0x0a);
-        num_pages = get_be32(out + 0x0c);
-        rc = mlx5_ctx_give_pages(&rt.ctx, function_id, num_pages,
-                                 "seq-give-init-pages");
-        if (rc != 0) {
-            goto out;
-        }
-    }
-    rc = mlx5_ctx_init_hca(&rt.ctx);
-    if (rc != 0) {
-        goto out;
-    }
-    rc = mlx5_ctx_query_paos(&rt.ctx, 1);
-    if (rc != 0) {
-        goto out;
-    }
-    if (create_rx_flow_table) {
-        rc = mlx5_ctx_enable_vport_promisc(&rt.ctx);
-        if (rc != 0) {
-            goto out;
-        }
-    }
-    rc = mlx5_ctx_alloc_uar(&rt.ctx, &rt.uar);
-    if (rc != 0) {
-        goto out;
-    }
-    rc = mlx5_ctx_alloc_pd(&rt.ctx, &rt.pd);
-    if (rc != 0) {
-        goto out;
-    }
-    rc = mlx5_ctx_alloc_transport_domain(&rt.ctx, &rt.tdn);
-    if (rc != 0) {
-        goto out;
-    }
-    rt.have_tdn = 1;
-    if (create_rx_objects) {
-        rc = mlx5_ctx_alloc_q_counter(&rt.ctx, &rt.q_counter);
-        if (rc != 0) {
-            goto out;
-        }
-        rt.have_q_counter = 1;
-    }
-    if (do_tx || post_rx) {
-        rc = mlx5_ctx_create_pa_mkey(&rt.ctx, rt.pd, &rt.mkey);
-        if (rc != 0) {
-            goto out;
-        }
-    }
-    if (do_tx) {
-        rc = mlx5_ctx_create_tis(&rt.ctx, rt.tdn, rt.pd, &rt.tisn);
-        if (rc != 0) {
-            goto out;
-        }
-        rt.have_tisn = 1;
-    }
-    rc = mlx5_ctx_create_eq(&rt.ctx, rt.uar, &rt.eq);
-    if (rc != 0) {
-        goto out;
-    }
-    rc = mlx5_ctx_create_cq(&rt.ctx, rt.uar, &rt.eq, &rt.cq);
-    if (rc != 0) {
-        goto out;
-    }
-    if (do_tx) {
-        rc = mlx5_ctx_create_sq(&rt.ctx, rt.uar, rt.pd, rt.tisn, &rt.cq, &rt.sq);
-        if (rc != 0) {
-            goto out;
-        }
-        rc = mlx5_ctx_modify_sq_ready(&rt.ctx, &rt.sq);
-        if (rc != 0) {
-            goto out;
-        }
-        rc = mlx5_ctx_query_sq(&rt.ctx, &rt.sq, "seq-query-sq-ready");
-        if (rc != 0) {
-            goto out;
-        }
-    }
-    if (create_rx_objects) {
-        rc = mlx5_ctx_create_rq(&rt.ctx, rt.pd, rt.q_counter, &rt.cq, &rt.rq);
-        if (rc != 0) {
-            goto out;
-        }
-        rc = mlx5_ctx_modify_rq_ready(&rt.ctx, &rt.rq);
-        if (rc != 0) {
-            goto out;
-        }
-        if (create_rx_flow_table) {
-            rc = mlx5_ctx_create_rqt(&rt.ctx, &rt.rq, &rt.rqt);
-            if (rc != 0) {
-                goto out;
-            }
-            (void)mlx5_ctx_query_rqt(&rt.ctx, &rt.rqt, "seq-query-rqt");
-            rc = mlx5_ctx_create_indirect_tir(&rt.ctx, rt.tdn, &rt.rqt, &rt.tir);
-            if (rc != 0) {
-                goto out;
-            }
-            (void)mlx5_ctx_query_tir(&rt.ctx, &rt.tir, "seq-query-indirect-tir");
-        } else {
-            rc = mlx5_ctx_create_direct_tir(&rt.ctx, rt.tdn, &rt.rq, &rt.tir);
-            if (rc != 0) {
-                goto out;
-            }
-            (void)mlx5_ctx_query_tir(&rt.ctx, &rt.tir, "seq-query-direct-tir");
-        }
-        if (post_rx) {
-            uint32_t post_count = wait_rx ? MLX5_RX_TEST_POST_COUNT : 1;
-            rc = mlx5_rq_post_buffers(&rt.ctx, &rt.rq, rt.mkey, post_count);
-            if (rc != 0) {
-                goto out;
-            }
-            (void)mlx5_ctx_query_rq(&rt.ctx, &rt.rq, "seq-query-rq-after-post");
-        }
-        if (create_rx_flow_table) {
-            rc = mlx5_ctx_create_rx_flow_table(&rt.ctx, &rt.ft);
-            if (rc != 0) {
-                goto out;
-            }
-            rc = mlx5_ctx_set_rx_flow_table_root(&rt.ctx, &rt.ft);
-            if (rc != 0) {
-                goto out;
-            }
-            rc = mlx5_ctx_create_rx_flow_group(&rt.ctx, &rt.ft, &rt.fg);
-            if (rc != 0) {
-                goto out;
-            }
-            rc = mlx5_ctx_set_rx_fte_to_tir(&rt.ctx, &rt.ft, &rt.fg, &rt.tir,
-                                            &rt.fte);
-            if (rc != 0) {
-                goto out;
-            }
-            if (wait_rx) {
-                if (do_tx && !rt.tx_done) {
-                    rc = mlx5_test_runtime_post_tx(&rt, count);
-                    if (rc != 0) {
-                        goto out;
-                    }
-                }
-                rc = mlx5_test_runtime_wait_rx(
-                    &rt, rx_wait_count, rx_timeout_ms, rx_pre_delay_ms, NULL,
-                    skip_local_tx_on_rx && do_tx ? "local-tx-prefix" : NULL,
-                    rx_stats);
-                if (rc != 0) {
-                    (void)mlx5_ctx_query_ppcnt_802_3(
-                        &rt.ctx, 1, "seq-query-ppcnt-after-rx-timeout");
-                    (void)mlx5_ctx_query_rq(&rt.ctx, &rt.rq,
-                                            "seq-query-rq-after-rx-timeout");
-                    goto out;
-                }
-                (void)mlx5_ctx_query_ppcnt_802_3(&rt.ctx, 1,
-                                                 "seq-query-ppcnt-after-rx");
-                (void)mlx5_ctx_query_rq(&rt.ctx, &rt.rq, "seq-query-rq-after-rx");
-            }
-        }
-    }
-    if (do_tx && !rt.tx_done) {
-        rc = mlx5_test_runtime_post_tx(&rt, count);
-        if (rc != 0) {
-            goto out;
-        }
-    }
-
-out:
-    mlx5_test_runtime_cleanup(&rt, &rc);
     return rc;
-}
-
-int mlx5_rx_objects(const char *bdf) {
-    struct mlx5_tx_test_opts opts = {0};
-    static const struct mlx5_run_profile profile = {
-        .banner = "mlx5-rx-objects",
-        .create_rx_objects = 1,
-    };
-
-    opts.count = 1;
-    return mlx5_run_profile(bdf, &opts, &profile, 0, 0, 0, NULL);
-}
-
-int mlx5_rx_post_test(const char *bdf) {
-    struct mlx5_tx_test_opts opts = {0};
-    static const struct mlx5_run_profile profile = {
-        .banner = "mlx5-rx-post-test",
-        .create_rx_objects = 1,
-        .post_rx = 1,
-    };
-
-    opts.count = 1;
-    return mlx5_run_profile(bdf, &opts, &profile, 0, 0, 0, NULL);
-}
-
-int mlx5_rx_steer_test(const char *bdf) {
-    struct mlx5_tx_test_opts opts = {0};
-    static const struct mlx5_run_profile profile = {
-        .banner = "mlx5-rx-steer-test",
-        .create_rx_objects = 1,
-        .post_rx = 1,
-        .create_rx_flow_table = 1,
-    };
-
-    opts.count = 1;
-    return mlx5_run_profile(bdf, &opts, &profile, 0, 0, 0, NULL);
 }

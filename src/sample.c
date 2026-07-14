@@ -13,6 +13,12 @@ enum {
     MLXNICD_SAMPLE_RX_WAIT_COUNT = 20,
 };
 
+static void sample_report_dev_error(const char *what, struct mlxnicd_dev *dev) {
+    int err = mlxnicd_dev_last_error(dev);
+
+    fprintf(stderr, "%s: %s (%d)\n", what, mlxnicd_strerror(err), err);
+}
+
 static void sample_dump_hex(const char *label, const void *buf, size_t len) {
     const uint8_t *p = buf;
     size_t i;
@@ -31,6 +37,44 @@ static void sample_dump_hex(const char *label, const void *buf, size_t len) {
 
 int sample_mlx5_seq_basic(const char *bdf) {
     return sample_mlx5_tx_test(bdf, 1);
+}
+
+static int sample_start_rx_dev(struct mlxnicd_dev **dev_out, const char *bdf,
+                               uint32_t rx_post_count, int promisc,
+                               const char *tag) {
+    struct mlxnicd_dev *dev = NULL;
+    struct mlxnicd_dev_config config;
+
+    mlxnicd_dev_config_init(&config);
+    config.flags = MLXNICD_DEV_F_RX | (promisc ? MLXNICD_DEV_F_PROMISC : 0);
+    config.rx_post_count = rx_post_count;
+    config.log_verbose = 1;
+
+    if (mlxnicd_dev_open(&dev, bdf) != 0) {
+        return -1;
+    }
+    if (mlxnicd_dev_configure(dev, &config) != 0) {
+        sample_report_dev_error("mlxnicd_dev_configure", dev);
+        mlxnicd_dev_close(dev);
+        return -1;
+    }
+    if (mlxnicd_dev_start(dev) != 0) {
+        sample_report_dev_error("mlxnicd_dev_start", dev);
+        mlxnicd_dev_close(dev);
+        return -1;
+    }
+
+    if (config.rx_post_count != 0) {
+        printf("%s: started bdf=%s flags=0x%08" PRIx32
+               " rx_post_count=%" PRIu32 "\n",
+               tag, bdf, config.flags, config.rx_post_count);
+    } else {
+        printf("%s: started bdf=%s flags=0x%08" PRIx32
+               " rx_post_count=default\n",
+               tag, bdf, config.flags);
+    }
+    *dev_out = dev;
+    return 0;
 }
 
 int sample_mlx5_tx_test(const char *bdf, unsigned int count) {
@@ -67,9 +111,11 @@ int sample_mlx5_tx_test_opts(const char *bdf,
         return -1;
     }
     if (mlxnicd_dev_configure(dev, &config) != 0) {
+        sample_report_dev_error("mlxnicd_dev_configure", dev);
         goto out;
     }
     if (mlxnicd_dev_start(dev) != 0) {
+        sample_report_dev_error("mlxnicd_dev_start", dev);
         goto out;
     }
 
@@ -77,6 +123,7 @@ int sample_mlx5_tx_test_opts(const char *bdf,
     pkt.len = frame_len;
     while (sent < count) {
         if (mlxnicd_tx_burst(dev, &pkt, 1) != 1) {
+            sample_report_dev_error("mlxnicd_tx_burst", dev);
             goto out;
         }
         sent++;
@@ -89,15 +136,42 @@ out:
 }
 
 int sample_mlx5_rx_objects(const char *bdf) {
-    return mlx5_rx_objects(bdf);
+    struct mlxnicd_dev *dev = NULL;
+    int rc = -1;
+
+    if (sample_start_rx_dev(&dev, bdf, 0, 0, "sample-rx-objects") != 0) {
+        return -1;
+    }
+    printf("sample-rx-objects: RX datapath objects are ready\n");
+    rc = 0;
+    mlxnicd_dev_close(dev);
+    return rc;
 }
 
 int sample_mlx5_rx_post_test(const char *bdf) {
-    return mlx5_rx_post_test(bdf);
+    struct mlxnicd_dev *dev = NULL;
+    int rc = -1;
+
+    if (sample_start_rx_dev(&dev, bdf, 1, 0, "sample-rx-post-test") != 0) {
+        return -1;
+    }
+    printf("sample-rx-post-test: initial RX buffers are posted\n");
+    rc = 0;
+    mlxnicd_dev_close(dev);
+    return rc;
 }
 
 int sample_mlx5_rx_steer_test(const char *bdf) {
-    return mlx5_rx_steer_test(bdf);
+    struct mlxnicd_dev *dev = NULL;
+    int rc = -1;
+
+    if (sample_start_rx_dev(&dev, bdf, 1, 1, "sample-rx-steer-test") != 0) {
+        return -1;
+    }
+    printf("sample-rx-steer-test: RX flow steering path is ready\n");
+    rc = 0;
+    mlxnicd_dev_close(dev);
+    return rc;
 }
 
 int sample_mlx5_rx_wait_test(const char *bdf) {
@@ -115,9 +189,11 @@ int sample_mlx5_rx_wait_test(const char *bdf) {
         return -1;
     }
     if (mlxnicd_dev_configure(dev, &config) != 0) {
+        sample_report_dev_error("mlxnicd_dev_configure", dev);
         goto out;
     }
     if (mlxnicd_dev_start(dev) != 0) {
+        sample_report_dev_error("mlxnicd_dev_start", dev);
         goto out;
     }
 
@@ -126,6 +202,7 @@ int sample_mlx5_rx_wait_test(const char *bdf) {
         size_t dump_len;
 
         if (got != 1) {
+            sample_report_dev_error("mlxnicd_rx_burst", dev);
             goto out;
         }
         printf("sample-rx-wait: packet=%" PRIu32 "/%u len=%" PRIu32 "\n",
@@ -139,6 +216,7 @@ int sample_mlx5_rx_wait_test(const char *bdf) {
         }
         sample_dump_hex("  rx frame", pkt.data, dump_len);
         if (mlxnicd_rx_release(dev, 1) != 0) {
+            sample_report_dev_error("mlxnicd_rx_release", dev);
             goto out;
         }
         accepted++;
@@ -203,14 +281,17 @@ int sample_raw_loop(const struct raw_loop_opts *raw_opts) {
         return -1;
     }
     if (mlxnicd_dev_configure(dev, &config) != 0) {
+        sample_report_dev_error("mlxnicd_dev_configure", dev);
         goto out;
     }
     if (mlxnicd_dev_start(dev) != 0) {
+        sample_report_dev_error("mlxnicd_dev_start", dev);
         goto out;
     }
     tx_pkt.data = frame;
     tx_pkt.len = frame_len;
     if (mlxnicd_tx_burst(dev, &tx_pkt, 1) != 1) {
+        sample_report_dev_error("mlxnicd_tx_burst", dev);
         goto out;
     }
     if (rx_pre_delay_ms > 0) {
@@ -225,6 +306,7 @@ int sample_raw_loop(const struct raw_loop_opts *raw_opts) {
         }
         got = mlxnicd_rx_burst(dev, &rx_pkt, 1, rx_timeout_ms);
         if (got != 1) {
+            sample_report_dev_error("mlxnicd_rx_burst", dev);
             goto out;
         }
         if (rx_pkt.len >= frame_len &&
@@ -241,6 +323,7 @@ int sample_raw_loop(const struct raw_loop_opts *raw_opts) {
             }
         }
         if (mlxnicd_rx_release(dev, 1) != 0) {
+            sample_report_dev_error("mlxnicd_rx_release", dev);
             goto out;
         }
     }

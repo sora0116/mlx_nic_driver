@@ -30,29 +30,34 @@ int main(void) {
         return 1;
     }
     if (mlxnicd_dev_configure(dev, &cfg) != 0) {
-        fprintf(stderr, "dev configure failed\n");
+        fprintf(stderr, "dev configure failed: %s\n",
+                mlxnicd_strerror(mlxnicd_dev_last_error(dev)));
         goto out;
     }
     if (mlxnicd_dev_start(dev) != 0) {
-        fprintf(stderr, "dev start failed\n");
+        fprintf(stderr, "dev start failed: %s\n",
+                mlxnicd_strerror(mlxnicd_dev_last_error(dev)));
         goto out;
     }
 
     tx_pkt.data = frame;
     tx_pkt.len = frame_len;
     if (mlxnicd_tx_burst(dev, &tx_pkt, 1) != 1) {
-        fprintf(stderr, "tx burst failed\n");
+        fprintf(stderr, "tx burst failed: %s\n",
+                mlxnicd_strerror(mlxnicd_dev_last_error(dev)));
         goto out;
     }
 
     if (mlxnicd_rx_burst(dev, &rx_pkt, 1, 10000) != 1) {
-        fprintf(stderr, "rx burst timed out\n");
+        fprintf(stderr, "rx burst failed: %s\n",
+                mlxnicd_strerror(mlxnicd_dev_last_error(dev)));
         goto out;
     }
 
     printf("received one packet: len=%u\n", rx_pkt.len);
     if (mlxnicd_rx_release(dev, 1) != 0) {
-        fprintf(stderr, "rx release failed\n");
+        fprintf(stderr, "rx release failed: %s\n",
+                mlxnicd_strerror(mlxnicd_dev_last_error(dev)));
         goto out;
     }
     rc = 0;

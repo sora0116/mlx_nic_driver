@@ -7,7 +7,7 @@ AR ?= ar
 TARGET := mlxnicd
 LIB := libmlxnicd.a
 EXAMPLE_API := examples/api_loop_minimal
-LIB_SRC := src/pci.c src/vfio.c src/mlx5.c
+LIB_SRC := src/pci.c src/vfio.c src/mlx5.c src/mlx5_debug.c
 LIB_OBJ := $(LIB_SRC:.c=.o)
 APP_SRC := src/main.c src/raw.c src/sample.c
 APP_OBJ := $(APP_SRC:.c=.o)
@@ -32,7 +32,7 @@ $(EXAMPLE_API): $(EXAMPLE_OBJ) $(LIB)
 $(LIB): $(LIB_OBJ)
 	$(AR) rcs $@ $^
 
-%.o: %.c src/pci.h src/vfio.h src/vfio_compat.h src/raw.h src/mlx5.h include/mlxnicd.h
+%.o: %.c src/pci.h src/vfio.h src/vfio_compat.h src/raw.h src/mlx5.h src/mlx5_priv.h include/mlxnicd.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 clean:

@@ -7,6 +7,15 @@
 #define MLXNICD_DEV_F_RX UINT32_C(0x0002)
 #define MLXNICD_DEV_F_PROMISC UINT32_C(0x0004)
 
+enum mlxnicd_error {
+    MLXNICD_OK = 0,
+    MLXNICD_ERR_INVAL = 1,
+    MLXNICD_ERR_STATE = 2,
+    MLXNICD_ERR_IO = 3,
+    MLXNICD_ERR_TIMEOUT = 4,
+    MLXNICD_ERR_UNSUPPORTED = 5,
+};
+
 struct mlxnicd_dev;
 
 struct mlxnicd_dev_config {
@@ -19,7 +28,10 @@ struct mlxnicd_dev_config {
 };
 
 struct mlxnicd_pkt {
-    /* RX packets point into driver-owned buffers until mlxnicd_rx_release(). */
+    /*
+     * RX packets point into driver-owned buffers until mlxnicd_rx_release().
+     * The caller must not retain this pointer after releasing the packet.
+     */
     const uint8_t *data;
     uint32_t len;
 };
@@ -43,15 +55,25 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev);
 void mlxnicd_dev_stop(struct mlxnicd_dev *dev);
 /* Stop if needed and free the device handle. */
 void mlxnicd_dev_close(struct mlxnicd_dev *dev);
+/* Returns one MLXNICD_* status value describing the last API failure. */
 int mlxnicd_dev_last_error(const struct mlxnicd_dev *dev);
+const char *mlxnicd_strerror(int err);
 
 /* Best-effort burst transmit. Returns number of packets actually posted. */
 uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
                           const struct mlxnicd_pkt *pkts, uint16_t nb_pkts);
-/* Poll for up to nb_pkts packets. RX buffers stay owned by the driver. */
+/*
+ * Poll for up to nb_pkts packets. RX buffers stay owned by the driver.
+ * Each packet returned here increments the number of packets that must later
+ * be released with mlxnicd_rx_release().
+ */
 uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
                           uint16_t nb_pkts, int timeout_ms);
-/* Release previously received packets and repost RX buffers. */
+/*
+ * Release previously received packets and repost RX buffers.
+ * nb_pkts must not exceed the number of packets returned by rx_burst() and not
+ * yet released.
+ */
 int mlxnicd_rx_release(struct mlxnicd_dev *dev, uint16_t nb_pkts);
 
 /* Convenience helper for building one L2 frame into an inline TX buffer. */

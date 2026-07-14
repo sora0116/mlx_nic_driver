@@ -76,6 +76,7 @@ make
 - `mlxnicd_dev_stop()`
 - `mlxnicd_dev_close()`
 - `mlxnicd_frame_build()`
+- `mlxnicd_strerror()`
 
 想定する基本フロー:
 
@@ -110,7 +111,20 @@ make examples
 
 - `mlxnicd_rx_burst()` が返す `pkt.data` は driver 管理バッファを指します
 - 読み終わったら `mlxnicd_rx_release()` を呼んで RX バッファを返す必要があります
+- `mlxnicd_rx_burst()` が返した packet 数だけ `mlxnicd_rx_release()` で返す必要があります
+- 返し過ぎは API error (`MLXNICD_ERR_INVAL`) として扱います
 - 今の API は single device / single queue の最小形です
+
+エラー契約:
+
+- 各 API は成功時に `MLXNICD_OK` 相当の状態を残します
+- 失敗理由は `mlxnicd_dev_last_error()` で取得します
+- 人間向け表示は `mlxnicd_strerror()` を使います
+- 現時点の主要 error:
+  - `MLXNICD_ERR_INVAL`
+  - `MLXNICD_ERR_STATE`
+  - `MLXNICD_ERR_IO`
+  - `MLXNICD_ERR_TIMEOUT`
 
 リモート同期:
 
@@ -118,10 +132,36 @@ make examples
 make sync
 ```
 
-## CLI / sample application
+## CLI / sample application / debug tool
 
 `mlxnicd` バイナリは、library を使う sample application 集合としても使います。
-特に `mlx5-*-test` と `raw-loop` は sample 層から呼ばれます。
+特に次は sample 層から呼ばれ、library API を使う経路です。
+
+- `mlx5-seq-basic`
+- `mlx5-tx-test`
+- `mlx5-rx-objects`
+- `mlx5-rx-post-test`
+- `mlx5-rx-steer-test`
+- `mlx5-rx-wait-test`
+- `raw-loop`
+
+一方で、次のコマンドは low-level bring-up / debug 用です。
+
+- `mlx5-info`
+- `mlx5-query-issi`
+- `mlx5-set-issi`
+- `mlx5-enable-hca`
+- `mlx5-query-pages`
+- `vfio-*`
+- `bar-read`
+- `inspect`
+- `list`
+
+つまり今の `mlxnicd` は次の 3 つを兼ねています。
+
+- library を使う sample application
+- low-level debug / bring-up tool
+- 運用補助 CLI
 
 現在の主要コマンド:
 
@@ -259,6 +299,10 @@ received one packet: len=60
   - `mlx5-tx-test`, `mlx5-rx-wait-test`, `raw-loop` の実装
   - library API を使う経路と、低レベル bring-up 検証用経路の橋渡し
 
+- `src/mlx5_debug.c`
+  - command path 系の public debug entry
+  - `mlx5-query-*`, `mlx5-enable-hca` などの front
+
 - `src/vfio.c`
   - VFIO readiness 確認
   - `vfio-pci` bind / restore
@@ -268,11 +312,13 @@ received one packet: len=60
 
 - `src/mlx5.c`
   - library 本体
-  - mlx5 command path 実装
-  - HCA 初期化
+  - library datapath / object lifecycle 実装
   - CQ/SQ/RQ/RQT/TIR/flow table/FTE 作成破棄
   - raw TX/RX datapath 実装
   - `mlxnicd_dev_*`, `mlxnicd_tx_burst()`, `mlxnicd_rx_burst()` の実装
+
+- `src/mlx5_priv.h`
+  - `mlx5.c` と `mlx5_debug.c` が共有する private context / helper 宣言
 
 ## 実装の詳細解説
 

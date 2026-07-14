@@ -17,8 +17,5 @@ int mlx5_set_issi(const char *bdf);
 int mlx5_query_hca_cap(const char *bdf);
 int mlx5_enable_hca(const char *bdf);
 int mlx5_query_pages(const char *bdf, int boot);
-int mlx5_rx_objects(const char *bdf);
-int mlx5_rx_post_test(const char *bdf);
-int mlx5_rx_steer_test(const char *bdf);
 
 #endif
