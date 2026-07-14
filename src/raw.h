@@ -27,6 +27,7 @@ struct raw_bench_opts {
     uint32_t window;
     uint32_t timeout_ms;
     uint32_t min_rtt_ns;
+    uint16_t queue_count;
     int rss_udp;
     int throughput_only;
     int verbose;

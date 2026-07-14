@@ -2,6 +2,8 @@
 #include "mlxnicd.h"
 
 #include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -17,7 +19,7 @@ enum {
     MLXNICD_SAMPLE_BENCH_MAGIC = 0x4d4c5842,
     MLXNICD_SAMPLE_BENCH_HDR_LEN = 24,
     /* A full-inline frame consumes two 64-byte SQ WQEBBs; SQ has 2048. */
-    MLXNICD_SAMPLE_BENCH_MAX_WINDOW = 1024,
+    MLXNICD_SAMPLE_BENCH_MAX_WINDOW = 4096,
     MLXNICD_SAMPLE_BENCH_RX_BURST = 128,
     MLXNICD_SAMPLE_BENCH_RX_POST_COUNT = 4096,
     MLXNICD_SAMPLE_BENCH_F_REPLY = 0x0001,
@@ -42,6 +44,24 @@ struct sample_bench_stats {
     uint64_t tx_last_ns;
     uint64_t rx_first_ns;
     uint64_t rx_last_ns;
+};
+
+struct sample_parallel_ctx {
+    struct mlxnicd_dev *dev;
+    const struct raw_bench_opts *opts;
+    const uint8_t *template_frame;
+    uint32_t frame_len;
+    uint8_t src_mac[6];
+    uint8_t dst_mac[6];
+    atomic_uint next_seq;
+    atomic_uint replies;
+    atomic_int failed;
+};
+
+struct sample_parallel_worker {
+    struct sample_parallel_ctx *ctx;
+    uint16_t queue_id;
+    uint64_t rx_frames;
 };
 
 static void sample_report_dev_error(const char *what, struct mlxnicd_dev *dev) {
@@ -337,6 +357,125 @@ static void sample_bench_build_from_template(const struct raw_bench_opts *opts,
     sample_put_be16(frame + header_off + 6, flags);
     sample_put_be32(frame + header_off + 8, seq);
     sample_put_be64(frame + header_off + 12, send_ns);
+}
+
+static int sample_bench_is_reflection_fast(const struct sample_parallel_ctx *ctx,
+                                           const struct mlxnicd_pkt *pkt) {
+    return pkt->len >= 14 &&
+           memcmp(pkt->data, ctx->src_mac, sizeof(ctx->src_mac)) == 0 &&
+           memcmp(pkt->data + 6, ctx->dst_mac, sizeof(ctx->dst_mac)) == 0;
+}
+
+static void *sample_bench_parallel_worker(void *arg) {
+    struct sample_parallel_worker *worker = arg;
+    struct sample_parallel_ctx *ctx = worker->ctx;
+    const uint32_t batch_cap = 32;
+    uint8_t frames[32][MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+    struct mlxnicd_pkt tx[32];
+    struct mlxnicd_pkt rx[128];
+    uint32_t idle = 0;
+
+    while (atomic_load_explicit(&ctx->replies, memory_order_relaxed) <
+               ctx->opts->packet_count &&
+           !atomic_load_explicit(&ctx->failed, memory_order_relaxed)) {
+        uint32_t batch = 0;
+
+        while (batch < batch_cap) {
+            uint32_t done = atomic_load_explicit(&ctx->replies,
+                                                 memory_order_relaxed);
+            uint32_t next = atomic_load_explicit(&ctx->next_seq,
+                                                 memory_order_relaxed);
+            uint32_t limit = done + ctx->opts->window;
+
+            if (next >= ctx->opts->packet_count || next >= limit) {
+                break;
+            }
+            if (!atomic_compare_exchange_weak_explicit(
+                    &ctx->next_seq, &next, next + 1, memory_order_relaxed,
+                    memory_order_relaxed)) {
+                continue;
+            }
+            sample_bench_build_from_template(ctx->opts, ctx->template_frame,
+                                             ctx->frame_len, next, 0, 0,
+                                             frames[batch]);
+            tx[batch].data = frames[batch];
+            tx[batch].len = ctx->frame_len;
+            batch++;
+        }
+        if (batch != 0 &&
+            mlxnicd_tx_burst_q(ctx->dev, worker->queue_id, tx,
+                               (uint16_t)batch) != batch) {
+            atomic_store(&ctx->failed, 1);
+            break;
+        }
+
+        {
+            uint16_t got = mlxnicd_rx_burst_q(ctx->dev, worker->queue_id, rx,
+                                               128, 0);
+            if (got != 0) {
+                for (uint16_t i = 0; i < got; i++) {
+                    worker->rx_frames++;
+                    if (sample_bench_is_reflection_fast(ctx, &rx[i])) {
+                        atomic_fetch_add_explicit(&ctx->replies, 1,
+                                                  memory_order_relaxed);
+                    }
+                }
+                if (mlxnicd_rx_release_q(ctx->dev, worker->queue_id, got) != 0) {
+                    atomic_store(&ctx->failed, 1);
+                    break;
+                }
+                idle = 0;
+            } else if (batch == 0 && ++idle > 100000000U) {
+                atomic_store(&ctx->failed, 1);
+                break;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int sample_raw_bench_parallel(struct mlxnicd_dev *dev,
+                                     const struct raw_bench_opts *opts,
+                                     const uint8_t *frame_template,
+                                     uint32_t frame_len,
+                                     struct sample_bench_stats *stats,
+                                     uint32_t *sent_out,
+                                     uint32_t *received_out) {
+    struct sample_parallel_ctx ctx = {.dev = dev, .opts = opts,
+                                      .template_frame = frame_template,
+                                      .frame_len = frame_len};
+    struct sample_parallel_worker workers[8] = {{0}};
+    pthread_t threads[8];
+    uint64_t start_ns = sample_now_ns();
+    int rc = -1;
+
+    if (sample_parse_mac_addr(opts->src_mac, ctx.src_mac) != 0 ||
+        sample_parse_mac_addr(opts->dst_mac, ctx.dst_mac) != 0) {
+        return -1;
+    }
+    for (uint16_t q = 0; q < opts->queue_count; q++) {
+        workers[q].ctx = &ctx;
+        workers[q].queue_id = q;
+        if (pthread_create(&threads[q], NULL, sample_bench_parallel_worker,
+                           &workers[q]) != 0) {
+            atomic_store(&ctx.failed, 1);
+            for (uint16_t i = 0; i < q; i++) pthread_join(threads[i], NULL);
+            return -1;
+        }
+    }
+    for (uint16_t q = 0; q < opts->queue_count; q++) pthread_join(threads[q], NULL);
+    *sent_out = atomic_load(&ctx.next_seq);
+    *received_out = atomic_load(&ctx.replies);
+    stats->tx_bytes = (uint64_t)*sent_out * frame_len;
+    stats->rx_bytes = (uint64_t)*received_out * frame_len;
+    stats->tx_first_ns = stats->rx_first_ns = start_ns;
+    stats->tx_last_ns = stats->rx_last_ns = sample_now_ns();
+    for (uint16_t q = 0; q < opts->queue_count; q++)
+        fprintf(stdout, "raw-bench: worker%u rx_frames=%" PRIu64 "\n", q,
+                workers[q].rx_frames);
+    rc = !atomic_load(&ctx.failed) && *sent_out == opts->packet_count &&
+         *received_out == opts->packet_count ? 0 : -1;
+    return rc;
 }
 
 static int sample_bench_parse_frame(const struct raw_bench_opts *opts,
@@ -878,6 +1017,8 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
     uint32_t received = 0;
     uint32_t inflight = 0;
     uint64_t throughput_start_ns = 0;
+    uint16_t rx_queue_cursor = 0;
+    uint64_t rx_queue_frames[8] = {0};
     int rc = -1;
 
     if (opts == NULL) {
@@ -898,6 +1039,7 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
     mlxnicd_dev_config_init(&config);
     config.flags = MLXNICD_DEV_F_TX | MLXNICD_DEV_F_RX | MLXNICD_DEV_F_PROMISC;
     config.rx_post_count = MLXNICD_SAMPLE_BENCH_RX_POST_COUNT;
+    config.queue_count = opts->queue_count;
     config.log_verbose = opts->verbose;
 
     fprintf(stdout,
@@ -918,6 +1060,12 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
     }
     if (mlxnicd_dev_start(dev) != 0) {
         sample_report_dev_error("mlxnicd_dev_start", dev);
+        goto out;
+    }
+    if (opts->throughput_only && opts->queue_count > 1) {
+        rc = sample_raw_bench_parallel(dev, opts, frame_template,
+                                       frame_template_len, &stats, &sent,
+                                       &received);
         goto out;
     }
     if (opts->throughput_only) {
@@ -1068,10 +1216,29 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
             uint16_t max_rx = inflight < MLXNICD_SAMPLE_BENCH_RX_BURST
                                   ? (uint16_t)inflight
                                   : MLXNICD_SAMPLE_BENCH_RX_BURST;
-            uint16_t got = mlxnicd_rx_burst(dev, rx_batch, max_rx,
-                                            poll_timeout_ms);
+            uint16_t got = 0;
+            uint16_t rx_queue = rx_queue_cursor;
+
+            for (uint16_t attempt = 0; attempt < opts->queue_count; attempt++) {
+                uint16_t q = (uint16_t)((rx_queue_cursor + attempt) %
+                                        opts->queue_count);
+                int timeout = opts->queue_count == 1 && attempt == 0
+                                  ? poll_timeout_ms
+                                  : 0;
+
+                got = mlxnicd_rx_burst_q(dev, q, rx_batch, max_rx, timeout);
+                if (got != 0) {
+                    rx_queue = q;
+                    rx_queue_frames[q] += got;
+                    rx_queue_cursor = (uint16_t)((q + 1) % opts->queue_count);
+                    break;
+                }
+            }
 
             if (got == 0) {
+                if (opts->queue_count > 1) {
+                    continue;
+                }
                 if (poll_timeout_ms == 0) {
                     continue;
                 }
@@ -1168,7 +1335,7 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
                     }
                 }
             }
-            if (mlxnicd_rx_release(dev, got) != 0) {
+            if (mlxnicd_rx_release_q(dev, rx_queue, got) != 0) {
                 sample_report_dev_error("mlxnicd_rx_release", dev);
                 goto out;
             }
@@ -1178,7 +1345,7 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
     rc = 0;
 
 out:
-    if (rc == 0 && opts->throughput_only) {
+    if (rc == 0 && opts->throughput_only && throughput_start_ns != 0) {
         uint64_t end_ns = sample_now_ns();
 
         stats.tx_first_ns = throughput_start_ns;
@@ -1222,6 +1389,12 @@ out:
                 "raw-bench: end-to-end %.3f Mpps %.3f Gbps\n",
                 sample_rate_pps(received, end_to_end_ns) / 1e6,
                 sample_rate_gbps(stats.rx_bytes, end_to_end_ns));
+        if (opts->queue_count > 1) {
+            for (uint16_t q = 0; q < opts->queue_count; q++) {
+                fprintf(stdout, "raw-bench: rxq%u frames=%" PRIu64 "\n", q,
+                        rx_queue_frames[q]);
+            }
+        }
     } else {
         fprintf(stdout,
                 "raw-bench: failed tx=%" PRIu32 " rx=%" PRIu32

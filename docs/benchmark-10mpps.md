@@ -33,6 +33,13 @@ headroom rather than RTT distribution.
 | 7 | Direct cyclic slot lookup (`seq % window`) instead of O(window) slot scan | RSS, window 1024 | 2.275 Mpps | Effective; out-of-order replies require waiting for a cyclic slot rather than overwriting it. |
 | 8 | Prebuilt benchmark frame template; patch only sequence/timestamp/UDP flow key | RSS, window 1024 | 2.469 Mpps | Effective (+8.5%). |
 | 9 | `--throughput-only`: no per-packet timestamp or latency accounting | RSS, window 1024 | **2.708 Mpps** | Effective (+9.7%); current best result. |
+| 10 | Four queue runtime, queue-specific burst API, four-RQ RQT and round-robin receive poll | RSS, window 128 | 2.708 Mpps | Correct but intentionally not faster: one thread still owns all polling. |
+| 11 | Four queue-specific worker threads, atomic global window/reply accounting | RSS throughput-only, window 1024 | **8.320 Mpps** | Effective (+207% over one worker); all four queues received 500,000 frames in a one-million-pair run. |
+| 12 | Four workers, window 2048 | RSS throughput-only | 8.667 Mpps | Small improvement, still below target. |
+| 13 | Eight-core DPDK peer | Four-worker source, window 2048 | 8.483 Mpps | Ineffective; peer used about 770% CPU but rate fell. |
+| 14 | Eight queue/eight worker source | window 1024 | 7.806 Mpps | Correct and evenly distributed, but slower than four workers. |
+| 15 | Eight queue/eight worker source | window 2048 | failed at 69,889/67,841 | Unrecovered global-window packet loss; do not use this setting. |
+| 16 | Four workers, window 3072 | Eight-core peer | 8.308 Mpps | Ineffective; larger window increases queueing rather than throughput. |
 
 ## Confirmed bottlenecks
 
@@ -51,6 +58,43 @@ cycles/pair, 3.47 IPC). A single Atom core cannot sustain 10 Mpps at this cost.
 The next architectural step is multiple SQ/RQ/CQ pairs and worker ownership;
 the benchmark packet's `--rss-udp` mode provides distinct UDP flows needed for
 hardware RSS distribution.
+
+## Multi-queue bring-up notes
+
+The driver now supports up to four queue pairs through `queue_count` in
+`mlxnicd_dev_config` and the queue-specific APIs `mlxnicd_tx_burst_q`,
+`mlxnicd_rx_burst_q`, and `mlxnicd_rx_release_q`. The original APIs remain
+queue-0 wrappers.
+
+The first four-queue run exposed an IOVA overlap: queue 1's SQ region collided
+with queue 2's TX CQ region, and VFIO correctly rejected the second mapping
+with `VFIO_IOMMU_MAP_DMA: File exists`. TX CQs and SQs now use disjoint IOVA
+ranges. A second issue was a 30-second blocking poll on queue 0; RSS may place
+the next completion on another queue. Multiqueue mode now probes each queue
+nonblocking in round-robin order. The corrected four-queue test completed
+10,000 IPv4/UDP RSS request/reply pairs without loss. A subsequent 100,000-pair
+distribution run showed all 200,000 received frames (local copies plus replies)
+on RX queue 0 and none on queues 1--3. The current indirect TIR sets a hash
+function but does not program the TIRC `rx_hash_field_select` / L3/L4 protocol
+field selectors, so the hardware hash is effectively fixed. Worker threading
+must wait until those IFC fields are implemented and every queue receives a
+nonzero share of the UDP flows.
+
+The selector layout was then taken from the Linux mlx5 IFC definition. An
+initial attempt used byte `0x48`; firmware rejected the TIR because that byte
+belongs to the Toeplitz-key region while `INVERTED_XOR8` is selected. The outer
+selector actually begins at TIRC byte `0x50` (bit `0x280`). Programming IPv4,
+UDP and the four source/destination IP/port fields there fixed the distribution:
+a 100,000-pair run received exactly 50,000 frames on each of four RX queues.
+This establishes hardware RSS as a working prerequisite for one worker per
+queue.
+
+This is a correctness milestone, not yet a parallel benchmark. A worker must
+own both an SQ and an RX queue, but RSS chooses the RX queue from the packet
+flow rather than from the source TX queue. Before assigning one worker per
+queue, the next experiment records the flow-to-RQ mapping and partitions
+benchmark flows accordingly; otherwise workers would need a shared completion
+table and lose much of the intended cache locality.
 
 ### Temporary peer limitation
 

@@ -1,7 +1,7 @@
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g
 CPPFLAGS ?= -D_DEFAULT_SOURCE -Iinclude
-LDFLAGS ?=
+LDFLAGS ?= -pthread
 AR ?= ar
 
 TARGET := mlxnicd

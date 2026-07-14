@@ -43,6 +43,10 @@ int raw_bench_run(const struct raw_bench_opts *opts) {
         fprintf(stderr, "--window must be greater than zero\n");
         bad = 1;
     }
+    if (opts->queue_count == 0 || opts->queue_count > 8) {
+        fprintf(stderr, "--queues must be in the range 1..8\n");
+        bad = 1;
+    }
     if (opts->rss_udp && strcmp(opts->ethertype, "0x0800") != 0 &&
         strcmp(opts->ethertype, "0x800") != 0) {
         fprintf(stderr, "--rss-udp requires --ethertype 0x0800\n");

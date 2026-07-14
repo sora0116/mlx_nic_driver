@@ -302,10 +302,12 @@ int main(int argc, char **argv) {
         uint32_t window = 8;
         uint32_t timeout_ms = 30000;
         uint32_t min_rtt_ns = 10000;
+        uint32_t queues = 1;
         const char *count_s = opt_value(argc, argv, "--count");
         const char *window_s = opt_value(argc, argv, "--window");
         const char *timeout_ms_s = opt_value(argc, argv, "--timeout-ms");
         const char *min_rtt_ns_s = opt_value(argc, argv, "--min-rtt-ns");
+        const char *queues_s = opt_value(argc, argv, "--queues");
 
         memset(&opts, 0, sizeof(opts));
         if (count_s != NULL && parse_u32(count_s, &count) != 0) {
@@ -326,6 +328,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "invalid --min-rtt-ns: %s\n", min_rtt_ns_s);
             return 2;
         }
+        if (queues_s != NULL && parse_u32(queues_s, &queues) != 0) {
+            fprintf(stderr, "invalid --queues: %s\n", queues_s);
+            return 2;
+        }
         opts.bdf = opt_value(argc, argv, "--bdf");
         opts.peer_if = opt_value(argc, argv, "--peer-if");
         opts.src_mac = opt_value(argc, argv, "--src-mac");
@@ -336,6 +342,7 @@ int main(int argc, char **argv) {
         opts.window = window;
         opts.timeout_ms = timeout_ms;
         opts.min_rtt_ns = min_rtt_ns;
+        opts.queue_count = (uint16_t)queues;
         opts.rss_udp = opt_present(argc, argv, "--rss-udp");
         opts.throughput_only = opt_present(argc, argv, "--throughput-only");
         opts.verbose = opt_present(argc, argv, "--verbose");

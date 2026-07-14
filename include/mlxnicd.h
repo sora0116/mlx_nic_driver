@@ -23,6 +23,8 @@ struct mlxnicd_dev_config {
     uint32_t flags;
     /* Number of RX buffers to pre-post at start time. 0 means default. */
     uint32_t rx_post_count;
+    /* Number of independent TX/RX queue pairs. 0 means one queue. */
+    uint16_t queue_count;
     /* 0: quiet, non-zero: verbose internal logs */
     int log_verbose;
 };
@@ -62,6 +64,10 @@ const char *mlxnicd_strerror(int err);
 /* Best-effort burst transmit. Returns number of packets actually posted. */
 uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
                           const struct mlxnicd_pkt *pkts, uint16_t nb_pkts);
+/* Queue-specific variants. Each queue must be owned by one calling thread. */
+uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
+                            const struct mlxnicd_pkt *pkts,
+                            uint16_t nb_pkts);
 /*
  * Poll for up to nb_pkts packets. RX buffers stay owned by the driver.
  * Each packet returned here increments the number of packets that must later
@@ -69,12 +75,17 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
  */
 uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
                           uint16_t nb_pkts, int timeout_ms);
+uint16_t mlxnicd_rx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
+                            struct mlxnicd_pkt *pkts, uint16_t nb_pkts,
+                            int timeout_ms);
 /*
  * Release previously received packets and repost RX buffers.
  * nb_pkts must not exceed the number of packets returned by rx_burst() and not
  * yet released.
  */
 int mlxnicd_rx_release(struct mlxnicd_dev *dev, uint16_t nb_pkts);
+int mlxnicd_rx_release_q(struct mlxnicd_dev *dev, uint16_t queue_id,
+                         uint16_t nb_pkts);
 
 /* Convenience helper for building one L2 frame into an inline TX buffer. */
 int mlxnicd_frame_build(const struct mlxnicd_l2_frame_spec *spec,

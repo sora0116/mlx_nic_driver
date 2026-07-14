@@ -177,6 +177,7 @@ enum {
 };
 
 #define MLX5_HW_START_PADDING UINT32_C(0x80000000)
+#define MLXNICD_MAX_QUEUES 8U
 #define MLX5_PAGE_SIZE 4096U
 #define MLX5_CQ_DMA_BYTES (MLX5_CQ_CQE_COUNT * MLX5_CQE_SIZE)
 #define MLX5_SQ_DMA_BYTES (MLX5_SQ_WQE_COUNT * (1U << MLX5_SEND_WQE_BB_LOG))
@@ -221,6 +222,7 @@ struct mlx5_rq_res {
     struct mlx5_dma_page rx_pages[MLX5_RQ_WQE_COUNT];
     uint32_t rqn;
     uint32_t prod_index;
+    uint64_t rx_iova_base;
     int valid;
 };
 
@@ -268,10 +270,11 @@ struct mlx5_test_runtime {
     int have_tisn;
     uint32_t mkey;
     struct mlx5_eq_res eq;
-    struct mlx5_cq_res tx_cq;
-    struct mlx5_cq_res rx_cq;
-    struct mlx5_sq_res sq;
-    struct mlx5_rq_res rq;
+    struct mlx5_cq_res tx_cq[MLXNICD_MAX_QUEUES];
+    struct mlx5_cq_res rx_cq[MLXNICD_MAX_QUEUES];
+    struct mlx5_sq_res sq[MLXNICD_MAX_QUEUES];
+    struct mlx5_rq_res rq[MLXNICD_MAX_QUEUES];
+    uint16_t queue_count;
     struct mlx5_rqt_res rqt;
     struct mlx5_tir_res tir;
     struct mlx5_flow_table_res ft;
@@ -287,7 +290,7 @@ struct mlxnicd_dev {
     int started;
     int last_error;
     int quiet_saved;
-    uint16_t rx_outstanding;
+    uint16_t rx_outstanding[MLXNICD_MAX_QUEUES];
 };
 
 static int mlxnicd_err_from_rc(int rc) {
@@ -1287,14 +1290,14 @@ static int mlx5_ctx_destroy_cq(struct mlx5_cmd_ctx *ctx, struct mlx5_cq_res *cq)
 static int mlx5_ctx_create_sq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
                               uint32_t pd, uint32_t tisn,
                               const struct mlx5_cq_res *cq,
-                              struct mlx5_sq_res *sq) {
+                              struct mlx5_sq_res *sq, uint16_t queue_id) {
     uint8_t in[MLX5_CREATE_SQ_IN_SIZE] = {0};
     uint8_t out[16] = {0};
     uint8_t *sqc = in + MLX5_CREATE_SQ_SQC_OFF;
     uint8_t *wq = sqc + MLX5_SQC_WQ_OFF;
-    const uint64_t sq_iova = 0x07100000ULL;
-    const uint64_t dbr_iova = 0x07140000ULL;
-    const uint64_t tx_iova = 0x07141000ULL;
+    const uint64_t sq_iova = 0x05000000ULL + (uint64_t)queue_id * 0x00100000ULL;
+    const uint64_t dbr_iova = sq_iova + 0x00040000ULL;
+    const uint64_t tx_iova = sq_iova + 0x00041000ULL;
     int rc;
 
     memset(sq, 0, sizeof(*sq));
@@ -1375,16 +1378,17 @@ static int mlx5_ctx_destroy_sq(struct mlx5_cmd_ctx *ctx, struct mlx5_sq_res *sq)
 static int mlx5_ctx_create_rq(struct mlx5_cmd_ctx *ctx, uint32_t pd,
                               uint8_t counter_set_id,
                               const struct mlx5_cq_res *cq,
-                              struct mlx5_rq_res *rq) {
+                              struct mlx5_rq_res *rq, uint16_t queue_id) {
     uint8_t in[MLX5_CREATE_RQ_IN_SIZE] = {0};
     uint8_t out[16] = {0};
     uint8_t *rqc = in + MLX5_CREATE_RQ_RQC_OFF;
     uint8_t *wq = rqc + MLX5_RQC_WQ_OFF;
-    const uint64_t rq_iova = 0x08000000ULL;
-    const uint64_t dbr_iova = 0x08010000ULL;
+    const uint64_t rq_iova = 0x0c000000ULL + (uint64_t)queue_id * 0x02000000ULL;
+    const uint64_t dbr_iova = rq_iova + 0x00010000ULL;
     int rc;
 
     memset(rq, 0, sizeof(*rq));
+    rq->rx_iova_base = rq_iova + 0x00100000ULL;
     if (!cq->valid) {
         fprintf(stderr, "cannot create RQ without a valid CQ\n");
         return -1;
@@ -1448,7 +1452,7 @@ static int mlx5_ctx_modify_rq_ready(struct mlx5_cmd_ctx *ctx,
 
 static int mlx5_rq_post_buffers(struct mlx5_cmd_ctx *ctx, struct mlx5_rq_res *rq,
                                 uint32_t mkey, uint32_t count) {
-    const uint64_t rx_iova_base = MLX5_RX_BUFFER_IOVA_BASE;
+    const uint64_t rx_iova_base = rq->rx_iova_base;
 
     if (!rq->valid) {
         fprintf(stderr, "cannot post RX WQE without a valid RQ\n");
@@ -1547,7 +1551,8 @@ static int mlx5_ctx_destroy_rq(struct mlx5_cmd_ctx *ctx, struct mlx5_rq_res *rq)
 }
 
 static int mlx5_ctx_create_rqt(struct mlx5_cmd_ctx *ctx,
-                               const struct mlx5_rq_res *rq,
+                               const struct mlx5_rq_res *rqs,
+                               uint16_t queue_count,
                                struct mlx5_rqt_res *rqt) {
     uint8_t in[MLX5_CREATE_RQT_IN_SIZE] = {0};
     uint8_t out[16] = {0};
@@ -1555,7 +1560,7 @@ static int mlx5_ctx_create_rqt(struct mlx5_cmd_ctx *ctx,
     int rc;
 
     memset(rqt, 0, sizeof(*rqt));
-    if (!rq->valid) {
+    if (queue_count == 0 || !rqs[0].valid) {
         fprintf(stderr, "cannot create RQT without a valid RQ\n");
         return -1;
     }
@@ -1564,15 +1569,15 @@ static int mlx5_ctx_create_rqt(struct mlx5_cmd_ctx *ctx,
     put_be16(rqtc + 0x16, MLX5_RQT_ENTRY_COUNT); /* rqt_max_size */
     put_be16(rqtc + 0x1a, MLX5_RQT_ENTRY_COUNT); /* rqt_actual_size */
     for (unsigned int i = 0; i < MLX5_RQT_ENTRY_COUNT; i++) {
-        put_be32(rqtc + 0xf0 + i * 4, rq->rqn & 0x00ffffffu);
+        put_be32(rqtc + 0xf0 + i * 4,
+                 rqs[i % queue_count].rqn & 0x00ffffffu);
     }
     rc = mlx5_cmd_exec(ctx, MLX5_CMD_OP_CREATE_RQT, in, sizeof(in), out,
                        sizeof(out), "seq-create-rqt");
     if (rc == 0) {
         rqt->rqtn = get_be32(out + 0x08) & 0x00ffffffu;
         rqt->valid = 1;
-        printf("  rqtn: %" PRIu32 " -> rqn %" PRIu32 "\n", rqt->rqtn,
-               rq->rqn);
+        printf("  rqtn: %" PRIu32 " -> %u RQs\n", rqt->rqtn, queue_count);
     }
     return rc;
 }
@@ -1676,6 +1681,16 @@ static int mlx5_ctx_create_indirect_tir(struct mlx5_cmd_ctx *ctx, uint32_t tdn,
     tirc[0x04] = 0x10; /* disp_type INDIRECT */
     put_be32(tirc + 0x20, rqt->rqtn & 0x00ffffffu); /* indirect_table */
     tirc[0x24] = 0x10; /* rx_hash_fn INVERTED_XOR8 */
+    /*
+     * rx_hash_field_selector_outer is at bit 0x280 (byte 0x50), after the
+     * 40-byte Toeplitz-key field. The
+     * selector is l3_prot_type:1, l4_prot_type:1, selected_fields:30.
+     * IPv4 is 0, UDP is 1, and the low four selected-field bits choose
+     * source/destination IP plus source/destination L4 port.  Without this
+     * selector the indirect TIR hashes a fixed field set and all traffic
+     * lands on RQT entry zero.
+     */
+    put_be32(tirc + 0x50, UINT32_C(0x4000000f));
     tirc[0x25] = (uint8_t)(tdn >> 16);
     tirc[0x26] = (uint8_t)(tdn >> 8);
     tirc[0x27] = (uint8_t)tdn;
@@ -2501,32 +2516,26 @@ static void mlx5_test_runtime_cleanup(struct mlx5_test_runtime *rt, int *rc_io) 
             rc = cleanup_rc;
         }
     }
-    if (rt->rq.valid || rt->rq.rq_page.addr != NULL || rt->rq.dbr_page.addr != NULL ||
-        rt->rq.rx_pages[0].addr != NULL) {
-        int cleanup_rc = mlx5_ctx_destroy_rq(&rt->ctx, &rt->rq);
-        if (rc == 0 && cleanup_rc != 0) {
-            rc = cleanup_rc;
+    for (uint16_t q = 0; q < rt->queue_count; q++) {
+        if (rt->rq[q].valid || rt->rq[q].rq_page.addr != NULL ||
+            rt->rq[q].dbr_page.addr != NULL || rt->rq[q].rx_pages[0].addr != NULL) {
+            int cleanup_rc = mlx5_ctx_destroy_rq(&rt->ctx, &rt->rq[q]);
+            if (rc == 0 && cleanup_rc != 0) rc = cleanup_rc;
         }
-    }
-    if (rt->sq.valid || rt->sq.sq_page.addr != NULL || rt->sq.dbr_page.addr != NULL ||
-        rt->sq.tx_page.addr != NULL) {
-        int cleanup_rc = mlx5_ctx_destroy_sq(&rt->ctx, &rt->sq);
-        if (rc == 0 && cleanup_rc != 0) {
-            rc = cleanup_rc;
+        if (rt->sq[q].valid || rt->sq[q].sq_page.addr != NULL ||
+            rt->sq[q].dbr_page.addr != NULL || rt->sq[q].tx_page.addr != NULL) {
+            int cleanup_rc = mlx5_ctx_destroy_sq(&rt->ctx, &rt->sq[q]);
+            if (rc == 0 && cleanup_rc != 0) rc = cleanup_rc;
         }
-    }
-    if (rt->rx_cq.valid || rt->rx_cq.cq_page.addr != NULL ||
-        rt->rx_cq.dbr_page.addr != NULL) {
-        int cleanup_rc = mlx5_ctx_destroy_cq(&rt->ctx, &rt->rx_cq);
-        if (rc == 0 && cleanup_rc != 0) {
-            rc = cleanup_rc;
+        if (rt->rx_cq[q].valid || rt->rx_cq[q].cq_page.addr != NULL ||
+            rt->rx_cq[q].dbr_page.addr != NULL) {
+            int cleanup_rc = mlx5_ctx_destroy_cq(&rt->ctx, &rt->rx_cq[q]);
+            if (rc == 0 && cleanup_rc != 0) rc = cleanup_rc;
         }
-    }
-    if (rt->tx_cq.valid || rt->tx_cq.cq_page.addr != NULL ||
-        rt->tx_cq.dbr_page.addr != NULL) {
-        int cleanup_rc = mlx5_ctx_destroy_cq(&rt->ctx, &rt->tx_cq);
-        if (rc == 0 && cleanup_rc != 0) {
-            rc = cleanup_rc;
+        if (rt->tx_cq[q].valid || rt->tx_cq[q].cq_page.addr != NULL ||
+            rt->tx_cq[q].dbr_page.addr != NULL) {
+            int cleanup_rc = mlx5_ctx_destroy_cq(&rt->ctx, &rt->tx_cq[q]);
+            if (rc == 0 && cleanup_rc != 0) rc = cleanup_rc;
         }
     }
     if (rt->eq.valid || rt->eq.page.addr != NULL) {
@@ -2583,6 +2592,7 @@ void mlxnicd_dev_config_init(struct mlxnicd_dev_config *config) {
     }
     memset(config, 0, sizeof(*config));
     config->rx_post_count = MLX5_RX_TEST_POST_COUNT;
+    config->queue_count = 1;
 }
 
 int mlxnicd_dev_open(struct mlxnicd_dev **out, const char *bdf) {
@@ -2634,9 +2644,18 @@ int mlxnicd_dev_configure(struct mlxnicd_dev *dev,
         mlxnicd_set_error(dev, MLXNICD_ERR_INVAL);
         return -1;
     }
+    if (config->queue_count > MLXNICD_MAX_QUEUES) {
+        fprintf(stderr, "queue_count=%u exceeds max=%u\n", config->queue_count,
+                MLXNICD_MAX_QUEUES);
+        mlxnicd_set_error(dev, MLXNICD_ERR_INVAL);
+        return -1;
+    }
     dev->config = *config;
     if (dev->config.rx_post_count == 0) {
         dev->config.rx_post_count = MLX5_RX_TEST_POST_COUNT;
+    }
+    if (dev->config.queue_count == 0) {
+        dev->config.queue_count = 1;
     }
     dev->last_error = MLXNICD_OK;
     return 0;
@@ -2652,7 +2671,7 @@ void mlxnicd_dev_stop(struct mlxnicd_dev *dev) {
         mlx5_test_runtime_cleanup(&dev->rt, &rc);
         dev->last_error = mlxnicd_err_from_rc(rc);
         dev->started = 0;
-        dev->rx_outstanding = 0;
+        memset(dev->rx_outstanding, 0, sizeof(dev->rx_outstanding));
         g_mlx5_stdout_quiet = dev->quiet_saved;
         vfio_set_stdout_quiet(0);
         mlx5_test_runtime_init(&dev->rt);
@@ -2713,6 +2732,7 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
     want_rx = (dev->config.flags & MLXNICD_DEV_F_RX) != 0;
     rt = &dev->rt;
     mlx5_test_runtime_init(rt);
+    rt->queue_count = dev->config.queue_count;
     dev->quiet_saved = g_mlx5_stdout_quiet;
     g_mlx5_stdout_quiet = dev->config.log_verbose ? 0 : 1;
     vfio_set_stdout_quiet(dev->config.log_verbose ? 0 : 1);
@@ -2844,47 +2864,39 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
     if (rc != 0) {
         goto out;
     }
-    if (want_tx) {
-        rc = mlx5_ctx_create_cq(&rt->ctx, rt->uar, &rt->eq, &rt->tx_cq,
-                                0x07000000ULL, 0x07040000ULL);
-        if (rc != 0) {
-            goto out;
+    for (uint16_t q = 0; q < rt->queue_count; q++) {
+        if (want_tx) {
+            uint64_t base = 0x04000000ULL + (uint64_t)q * 0x00100000ULL;
+            rc = mlx5_ctx_create_cq(&rt->ctx, rt->uar, &rt->eq, &rt->tx_cq[q],
+                                    base, base + 0x00040000ULL);
+            if (rc != 0) goto out;
+            rc = mlx5_ctx_create_sq(&rt->ctx, rt->uar, rt->pd, rt->tisn,
+                                    &rt->tx_cq[q], &rt->sq[q], q);
+            if (rc != 0) goto out;
+            rc = mlx5_ctx_modify_sq_ready(&rt->ctx, &rt->sq[q]);
+            if (rc != 0) goto out;
         }
-        rc = mlx5_ctx_create_sq(&rt->ctx, rt->uar, rt->pd, rt->tisn,
-                                &rt->tx_cq, &rt->sq);
-        if (rc != 0) {
-            goto out;
-        }
-        rc = mlx5_ctx_modify_sq_ready(&rt->ctx, &rt->sq);
-        if (rc != 0) {
-            goto out;
+        if (want_rx) {
+            uint64_t base = 0x0a000000ULL + (uint64_t)q * 0x00200000ULL;
+            rc = mlx5_ctx_create_cq(&rt->ctx, rt->uar, &rt->eq, &rt->rx_cq[q],
+                                    base, base + 0x00040000ULL);
+            if (rc != 0) goto out;
+            rc = mlx5_ctx_create_rq(&rt->ctx, rt->pd, rt->q_counter,
+                                    &rt->rx_cq[q], &rt->rq[q], q);
+            if (rc != 0) goto out;
+            rc = mlx5_ctx_modify_rq_ready(&rt->ctx, &rt->rq[q]);
+            if (rc != 0) goto out;
+            rc = mlx5_rq_post_buffers(&rt->ctx, &rt->rq[q], rt->mkey,
+                                      dev->config.rx_post_count);
+            if (rc != 0) goto out;
         }
     }
     if (want_rx) {
-        rc = mlx5_ctx_create_cq(&rt->ctx, rt->uar, &rt->eq, &rt->rx_cq,
-                                0x0a000000ULL, 0x0a040000ULL);
-        if (rc != 0) {
-            goto out;
-        }
-        rc = mlx5_ctx_create_rq(&rt->ctx, rt->pd, rt->q_counter, &rt->rx_cq,
-                                &rt->rq);
-        if (rc != 0) {
-            goto out;
-        }
-        rc = mlx5_ctx_modify_rq_ready(&rt->ctx, &rt->rq);
-        if (rc != 0) {
-            goto out;
-        }
-        rc = mlx5_ctx_create_rqt(&rt->ctx, &rt->rq, &rt->rqt);
+        rc = mlx5_ctx_create_rqt(&rt->ctx, rt->rq, rt->queue_count, &rt->rqt);
         if (rc != 0) {
             goto out;
         }
         rc = mlx5_ctx_create_indirect_tir(&rt->ctx, rt->tdn, &rt->rqt, &rt->tir);
-        if (rc != 0) {
-            goto out;
-        }
-        rc = mlx5_rq_post_buffers(&rt->ctx, &rt->rq, rt->mkey,
-                                  dev->config.rx_post_count);
         if (rc != 0) {
             goto out;
         }
@@ -2909,20 +2921,21 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
 
     dev->last_error = MLXNICD_OK;
     dev->started = 1;
-    dev->rx_outstanding = 0;
+    memset(dev->rx_outstanding, 0, sizeof(dev->rx_outstanding));
     return 0;
 
 out:
     mlx5_test_runtime_cleanup(rt, &rc);
     dev->last_error = mlxnicd_err_from_rc(rc);
-    dev->rx_outstanding = 0;
+    memset(dev->rx_outstanding, 0, sizeof(dev->rx_outstanding));
     g_mlx5_stdout_quiet = dev->quiet_saved;
     vfio_set_stdout_quiet(0);
     return -1;
 }
 
-uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
-                          const struct mlxnicd_pkt *pkts, uint16_t nb_pkts) {
+uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
+                            const struct mlxnicd_pkt *pkts,
+                            uint16_t nb_pkts) {
     uint16_t sent = 0;
 
     if (dev == NULL || pkts == NULL) {
@@ -2930,6 +2943,10 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
     }
     if (!dev->started || (dev->config.flags & MLXNICD_DEV_F_TX) == 0) {
         dev->last_error = MLXNICD_ERR_STATE;
+        return 0;
+    }
+    if (queue_id >= dev->rt.queue_count) {
+        dev->last_error = MLXNICD_ERR_INVAL;
         return 0;
     }
 
@@ -2943,7 +2960,7 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
         }
         for (uint16_t i = 0; i < batch; i++) {
             int rc = mlx5_sq_prepare_send_raw(dev->rt.tisn, dev->rt.mkey,
-                                               &dev->rt.sq,
+                                               &dev->rt.sq[queue_id],
                                                pkts[sent + i].data,
                                                pkts[sent + i].len,
                                                i + 1 == batch, &last_wqe);
@@ -2952,8 +2969,9 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
                 return sent;
             }
         }
-        if (mlx5_sq_ring_send(&dev->rt.ctx, dev->rt.uar, &dev->rt.tx_cq,
-                              &dev->rt.sq, last_wqe) != 0) {
+        if (mlx5_sq_ring_send(&dev->rt.ctx, dev->rt.uar,
+                              &dev->rt.tx_cq[queue_id],
+                              &dev->rt.sq[queue_id], last_wqe) != 0) {
             dev->last_error = MLXNICD_ERR_IO;
             return sent;
         }
@@ -2965,13 +2983,21 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
     return sent;
 }
 
-static int mlx5_rx_poll_one_api(struct mlxnicd_dev *dev, int timeout_ms,
-                                struct mlx5_rx_packet *pkt) {
-    return mlx5_rx_poll_one(&dev->rt.rx_cq, &dev->rt.rq, timeout_ms, pkt);
+uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
+                          const struct mlxnicd_pkt *pkts, uint16_t nb_pkts) {
+    return mlxnicd_tx_burst_q(dev, 0, pkts, nb_pkts);
 }
 
-uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
-                          uint16_t nb_pkts, int timeout_ms) {
+static int mlx5_rx_poll_one_api(struct mlxnicd_dev *dev, uint16_t queue_id,
+                                int timeout_ms,
+                                struct mlx5_rx_packet *pkt) {
+    return mlx5_rx_poll_one(&dev->rt.rx_cq[queue_id], &dev->rt.rq[queue_id],
+                            timeout_ms, pkt);
+}
+
+uint16_t mlxnicd_rx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
+                            struct mlxnicd_pkt *pkts, uint16_t nb_pkts,
+                            int timeout_ms) {
     uint16_t received = 0;
 
     if (dev == NULL || pkts == NULL) {
@@ -2981,10 +3007,15 @@ uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
         dev->last_error = MLXNICD_ERR_STATE;
         return 0;
     }
+    if (queue_id >= dev->rt.queue_count) {
+        dev->last_error = MLXNICD_ERR_INVAL;
+        return 0;
+    }
 
     while (received < nb_pkts) {
         struct mlx5_rx_packet pkt = {0};
-        int rc = mlx5_rx_poll_one_api(dev, received == 0 ? timeout_ms : 0, &pkt);
+        int rc = mlx5_rx_poll_one_api(dev, queue_id,
+                                      received == 0 ? timeout_ms : 0, &pkt);
 
         if (rc != 0) {
             if (received == 0) {
@@ -2998,13 +3029,19 @@ uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
     }
     if (received > 0) {
         dev->last_error = MLXNICD_OK;
-        dev->rx_outstanding =
-            (uint16_t)(dev->rx_outstanding + received);
+        dev->rx_outstanding[queue_id] =
+            (uint16_t)(dev->rx_outstanding[queue_id] + received);
     }
     return received;
 }
 
-int mlxnicd_rx_release(struct mlxnicd_dev *dev, uint16_t nb_pkts) {
+uint16_t mlxnicd_rx_burst(struct mlxnicd_dev *dev, struct mlxnicd_pkt *pkts,
+                          uint16_t nb_pkts, int timeout_ms) {
+    return mlxnicd_rx_burst_q(dev, 0, pkts, nb_pkts, timeout_ms);
+}
+
+int mlxnicd_rx_release_q(struct mlxnicd_dev *dev, uint16_t queue_id,
+                         uint16_t nb_pkts) {
     if (dev == NULL) {
         return -1;
     }
@@ -3012,19 +3049,25 @@ int mlxnicd_rx_release(struct mlxnicd_dev *dev, uint16_t nb_pkts) {
         dev->last_error = MLXNICD_ERR_STATE;
         return -1;
     }
-    if (nb_pkts > dev->rx_outstanding) {
+    if (queue_id >= dev->rt.queue_count ||
+        nb_pkts > dev->rx_outstanding[queue_id]) {
         dev->last_error = MLXNICD_ERR_INVAL;
         return -1;
     }
     if (nb_pkts != 0 &&
-        mlx5_rq_post_buffers(&dev->rt.ctx, &dev->rt.rq, dev->rt.mkey,
+        mlx5_rq_post_buffers(&dev->rt.ctx, &dev->rt.rq[queue_id], dev->rt.mkey,
                              nb_pkts) != 0) {
         dev->last_error = MLXNICD_ERR_IO;
         return -1;
     }
-    dev->rx_outstanding = (uint16_t)(dev->rx_outstanding - nb_pkts);
+    dev->rx_outstanding[queue_id] =
+        (uint16_t)(dev->rx_outstanding[queue_id] - nb_pkts);
     dev->last_error = MLXNICD_OK;
     return 0;
+}
+
+int mlxnicd_rx_release(struct mlxnicd_dev *dev, uint16_t nb_pkts) {
+    return mlxnicd_rx_release_q(dev, 0, nb_pkts);
 }
 int mlx5_ctx_query_hca_cap(struct mlx5_cmd_ctx *ctx) {
     uint8_t cap[MLX5_HCA_CAP_OUT_SIZE] = {0};
