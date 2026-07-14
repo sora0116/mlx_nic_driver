@@ -1223,3 +1223,29 @@ group 15), but `sdn-svr5` cannot yet do so. Its boot setting was changed from
 Enable Intel VT-d/IOMMU in `sdn-svr5` firmware (and confirm firmware exports a
 DMAR table), reboot, then verify that `0000:01:00.1` has a nonempty IOMMU group
 before executing `vfio-bind`.
+
+## 10 Mpps benchmark milestone (2026-07-14)
+
+The 10 Mpps bidirectional raw-packet target is now met with the custom driver
+on `sdn-svr6` and a temporary DPDK peer on `sdn-svr5`.
+
+The immediate cause of the former 8.3--8.7 Mpps plateau was source-side cache
+line contention, not `testpmd`: every source worker updated global atomic
+`next_seq` and `replies` counters on its send and receive hot paths.
+`sample_raw_bench_parallel()` now assigns each worker a disjoint sequence range
+and a local reply counter.  It divides the global outstanding window evenly
+among the workers; only the infrequent failure flag remains shared.
+
+With `peer/dpdk-macswap-peer` (four DPDK RSS RX/TX queues and workers), two
+independent 1,000,000-pair runs completed without loss:
+
+```text
+10.617 Mpps / 5.606 Gbps
+10.588 Mpps / 5.590 Gbps
+```
+
+Every worker sent and received exactly 250,000 packets in each run.  The full
+measurement table, peer experiments, and exact commands are maintained in
+`docs/benchmark-10mpps.md`.  The peer is currently a DPDK process because
+`sdn-svr5` still lacks IOMMU groups; retain this benchmark as a regression test
+until the self-driver peer path becomes deployable.

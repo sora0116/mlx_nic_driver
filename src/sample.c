@@ -53,14 +53,17 @@ struct sample_parallel_ctx {
     uint32_t frame_len;
     uint8_t src_mac[6];
     uint8_t dst_mac[6];
-    atomic_uint next_seq;
-    atomic_uint replies;
     atomic_int failed;
 };
 
 struct sample_parallel_worker {
     struct sample_parallel_ctx *ctx;
     uint16_t queue_id;
+    uint32_t seq_begin;
+    uint32_t seq_next;
+    uint32_t seq_end;
+    uint32_t window;
+    uint32_t replies;
     uint64_t rx_frames;
 };
 
@@ -375,32 +378,19 @@ static void *sample_bench_parallel_worker(void *arg) {
     struct mlxnicd_pkt rx[128];
     uint32_t idle = 0;
 
-
-    while (atomic_load_explicit(&ctx->replies, memory_order_relaxed) <
-               ctx->opts->packet_count &&
+    while (worker->replies < worker->seq_end - worker->seq_begin &&
            !atomic_load_explicit(&ctx->failed, memory_order_relaxed)) {
         uint32_t batch = 0;
 
-        while (batch < batch_cap) {
-            uint32_t done = atomic_load_explicit(&ctx->replies,
-                                                 memory_order_relaxed);
-            uint32_t next = atomic_load_explicit(&ctx->next_seq,
-                                                 memory_order_relaxed);
-            uint32_t limit = done + ctx->opts->window;
-
-            if (next >= ctx->opts->packet_count || next >= limit) {
-                break;
-            }
-            if (!atomic_compare_exchange_weak_explicit(
-                    &ctx->next_seq, &next, next + 1, memory_order_relaxed,
-                    memory_order_relaxed)) {
-                continue;
-            }
+        while (batch < batch_cap && worker->seq_next < worker->seq_end &&
+               worker->seq_next - worker->seq_begin <
+                   worker->replies + worker->window) {
             sample_bench_build_from_template(ctx->opts, ctx->template_frame,
-                                             ctx->frame_len, next, 0, 0,
+                                             ctx->frame_len, worker->seq_next, 0, 0,
                                              frames[batch]);
             tx[batch].data = frames[batch];
             tx[batch].len = ctx->frame_len;
+            worker->seq_next++;
             batch++;
         }
         if (batch != 0 &&
@@ -417,8 +407,7 @@ static void *sample_bench_parallel_worker(void *arg) {
                 for (uint16_t i = 0; i < got; i++) {
                     worker->rx_frames++;
                     if (sample_bench_is_reflection_fast(ctx, &rx[i])) {
-                        atomic_fetch_add_explicit(&ctx->replies, 1,
-                                                  memory_order_relaxed);
+                        worker->replies++;
                     }
                 }
                 if (mlxnicd_rx_release_q(ctx->dev, worker->queue_id, got) != 0) {
@@ -448,6 +437,8 @@ static int sample_raw_bench_parallel(struct mlxnicd_dev *dev,
     struct sample_parallel_worker workers[8] = {{0}};
     pthread_t threads[8];
     uint64_t start_ns = sample_now_ns();
+    uint64_t total_sent = 0;
+    uint64_t total_received = 0;
     int rc = -1;
 
     if (sample_parse_mac_addr(opts->src_mac, ctx.src_mac) != 0 ||
@@ -457,6 +448,13 @@ static int sample_raw_bench_parallel(struct mlxnicd_dev *dev,
     for (uint16_t q = 0; q < opts->queue_count; q++) {
         workers[q].ctx = &ctx;
         workers[q].queue_id = q;
+        workers[q].seq_begin =
+            (uint32_t)(((uint64_t)opts->packet_count * q) / opts->queue_count);
+        workers[q].seq_next = workers[q].seq_begin;
+        workers[q].seq_end = (uint32_t)(((uint64_t)opts->packet_count * (q + 1)) /
+                                        opts->queue_count);
+        workers[q].window = opts->window / opts->queue_count;
+        if (workers[q].window == 0) workers[q].window = 1;
         if (pthread_create(&threads[q], NULL, sample_bench_parallel_worker,
                            &workers[q]) != 0) {
             atomic_store(&ctx.failed, 1);
@@ -465,15 +463,22 @@ static int sample_raw_bench_parallel(struct mlxnicd_dev *dev,
         }
     }
     for (uint16_t q = 0; q < opts->queue_count; q++) pthread_join(threads[q], NULL);
-    *sent_out = atomic_load(&ctx.next_seq);
-    *received_out = atomic_load(&ctx.replies);
+    for (uint16_t q = 0; q < opts->queue_count; q++) {
+        total_sent += workers[q].seq_next - workers[q].seq_begin;
+        total_received += workers[q].replies;
+    }
+    *sent_out = (uint32_t)total_sent;
+    *received_out = (uint32_t)total_received;
     stats->tx_bytes = (uint64_t)*sent_out * frame_len;
     stats->rx_bytes = (uint64_t)*received_out * frame_len;
     stats->tx_first_ns = stats->rx_first_ns = start_ns;
     stats->tx_last_ns = stats->rx_last_ns = sample_now_ns();
     for (uint16_t q = 0; q < opts->queue_count; q++)
-        fprintf(stdout, "raw-bench: worker%u rx_frames=%" PRIu64 "\n", q,
-                workers[q].rx_frames);
+        fprintf(stdout,
+                "raw-bench: worker%u sent=%u replies=%u rx_frames=%" PRIu64
+                "\n",
+                q, workers[q].seq_next - workers[q].seq_begin,
+                workers[q].replies, workers[q].rx_frames);
     rc = !atomic_load(&ctx.failed) && *sent_out == opts->packet_count &&
          *received_out == opts->packet_count ? 0 : -1;
     return rc;

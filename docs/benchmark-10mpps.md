@@ -45,6 +45,7 @@ headroom rather than RTT distribution.
 | 19 | Align peer burst with the source's 32-packet TX batch (`--burst=32`, 2,048 descriptors) | Four-worker source, window 2048 | 8.125 Mpps | Ineffective; smaller peer batches reduce throughput. |
 | 20 | Restore 4 forwarding cores, 4 RX/TX queues, burst 128, 1,024 descriptors | Four-worker source, window 2048 | 8.291 Mpps (8.667 Mpps historical best) | Current best peer configuration. The difference from step 12 is normal run-to-run variation; both runs completed all one million pairs. |
 | 21 | Replace `testpmd` with repository `dpdk-macswap-peer`: dedicated RX burst → in-place MAC swap → TX burst loop | Four DPDK workers/queues, window 2048 | 8.315, 8.350 Mpps | Correct and reproducible, but not faster than the 8.667 Mpps `testpmd` peak. `testpmd` control-plane overhead is not the limiting factor. |
+| 22 | Give each source worker a private sequence range, reply counter, and one-quarter of the global outstanding window; remove per-packet shared `next_seq`/`replies` atomics | Four source workers/queues, dedicated DPDK peer, window 2048 | **10.617, 10.588 Mpps** | Effective (+27% over the 8.350 Mpps dedicated-peer baseline). Both runs completed 1,000,000/1,000,000 pairs; every worker completed exactly 250,000 sends and replies. **10 Mpps target achieved.** |
 
 ## Confirmed bottlenecks
 
@@ -63,6 +64,24 @@ cycles/pair, 3.47 IPC). A single Atom core cannot sustain 10 Mpps at this cost.
 The next architectural step is multiple SQ/RQ/CQ pairs and worker ownership;
 the benchmark packet's `--rss-udp` mode provides distinct UDP flows needed for
 hardware RSS distribution.
+
+### Multi-worker atomic contention (resolved)
+
+The first four-worker implementation used shared atomic `next_seq` and
+`replies` counters in every hot-loop iteration.  Sending a packet performed a
+load/CAS sequence on `next_seq`; receiving a reply performed an atomic
+increment on `replies`.  All four workers therefore repeatedly invalidated the
+same cache lines even though each already owned a separate SQ and RX queue.
+
+The parallel benchmark now partitions the packet-count range evenly among the
+workers.  A worker owns its `seq_begin..seq_end` range, its local next-sequence
+value, and its reply counter.  It may transmit while its local in-flight count
+is below `window / queue_count`; the aggregate outstanding limit remains 2048.
+Only the rare error flag is shared.  With the dedicated DPDK peer, two
+one-million-pair runs reached 10.617 and 10.588 Mpps, respectively.  Each
+worker reported exactly 250,000 transmitted packets and 250,000 replies.
+This is both a correctness check for the partitioning and evidence that cache
+line contention, rather than the DPDK peer, was the final blocker to 10 Mpps.
 
 ### Research-paper comparison and DPDK peer conclusion
 
@@ -189,10 +208,7 @@ allowed NIC and one main lcore plus one worker lcore per queue.
 
 ## Next work
 
-1. Remove global atomic contention from the four source workers by assigning
-   each worker a private sequence range and a private completion counter.
-2. Measure the resulting 1, 2, and 4 worker rates against the unchanged peer.
-3. Compare the repository's `peer/dpdk-macswap-peer` (a dedicated DPDK
-   MAC-swap loop) with `testpmd` fairly before attributing any remaining limit
-   to the peer.
-4. Record every result here, including regressions.
+The 10 Mpps target is met.  Follow-on work should retain this benchmark as a
+regression test, add latency measurement that does not perturb the throughput
+path, and validate the same queue-local accounting against a custom-driver
+peer once `sdn-svr5` exposes usable IOMMU groups.
