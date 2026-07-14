@@ -16,9 +16,9 @@ enum {
     MLXNICD_SAMPLE_RX_WAIT_COUNT = 20,
     MLXNICD_SAMPLE_BENCH_MAGIC = 0x4d4c5842,
     MLXNICD_SAMPLE_BENCH_HDR_LEN = 24,
-    /* A full-inline frame consumes two 64-byte SQ WQEBBs; SQ has 16. */
-    MLXNICD_SAMPLE_BENCH_MAX_WINDOW = 8,
-    MLXNICD_SAMPLE_BENCH_RX_POST_COUNT = 16,
+    /* A full-inline frame consumes two 64-byte SQ WQEBBs; SQ has 256. */
+    MLXNICD_SAMPLE_BENCH_MAX_WINDOW = 128,
+    MLXNICD_SAMPLE_BENCH_RX_POST_COUNT = 256,
     MLXNICD_SAMPLE_BENCH_F_REPLY = 0x0001,
 };
 
@@ -308,6 +308,21 @@ static int sample_bench_parse_frame(const struct raw_bench_opts *opts,
     *seq = sample_get_be32(pkt->data + 22);
     *send_ns = sample_get_be64(pkt->data + 26);
     return 0;
+}
+
+/* Accept a DPDK macswap loopback that preserves the benchmark payload. */
+static int sample_bench_is_l2_reflection(const struct raw_bench_opts *opts,
+                                         const struct mlxnicd_pkt *pkt) {
+    uint8_t src[6];
+    uint8_t dst[6];
+
+    if (opts == NULL || pkt == NULL || pkt->len < 14 ||
+        sample_parse_mac_addr(opts->src_mac, src) != 0 ||
+        sample_parse_mac_addr(opts->dst_mac, dst) != 0) {
+        return 0;
+    }
+    return memcmp(pkt->data, src, sizeof(src)) == 0 &&
+           memcmp(pkt->data + 6, dst, sizeof(dst)) == 0;
 }
 
 static void sample_bench_stats_note_latency(struct sample_bench_stats *stats,
@@ -669,6 +684,118 @@ out:
     return rc;
 }
 
+int sample_raw_echo(const struct raw_echo_opts *opts) {
+    struct mlxnicd_dev *dev = NULL;
+    struct mlxnicd_dev_config config;
+    struct mlxnicd_pkt rx_pkt = {0};
+    struct mlxnicd_pkt tx_pkt = {0};
+    uint16_t ethertype;
+    uint32_t echoed = 0;
+    uint32_t filtered = 0;
+    uint32_t already_reply = 0;
+    int rc = -1;
+
+    if (opts == NULL) {
+        fprintf(stderr, "raw-echo options are required\n");
+        return -1;
+    }
+    if (sample_parse_ethertype16(opts->ethertype, &ethertype) != 0) {
+        fprintf(stderr, "raw-echo: invalid ethertype: %s\n", opts->ethertype);
+        return -1;
+    }
+
+    mlxnicd_dev_config_init(&config);
+    config.flags = MLXNICD_DEV_F_TX | MLXNICD_DEV_F_RX | MLXNICD_DEV_F_PROMISC;
+    config.rx_post_count = MLXNICD_SAMPLE_BENCH_RX_POST_COUNT;
+    config.log_verbose = opts->verbose;
+
+    fprintf(stdout,
+            "raw-echo: peer-if=%s bdf=%s ethertype=0x%04" PRIx16
+            " count=%" PRIu32 " timeout=%" PRIu32 " ms\n",
+            opts->peer_if, opts->bdf, ethertype, opts->packet_count,
+            opts->timeout_ms);
+
+    if (mlxnicd_dev_open(&dev, opts->bdf) != 0) {
+        return -1;
+    }
+    if (mlxnicd_dev_configure(dev, &config) != 0) {
+        sample_report_dev_error("mlxnicd_dev_configure", dev);
+        goto out;
+    }
+    if (mlxnicd_dev_start(dev) != 0) {
+        sample_report_dev_error("mlxnicd_dev_start", dev);
+        goto out;
+    }
+
+    while (echoed < opts->packet_count) {
+        uint16_t flags;
+        uint8_t mac[6];
+        uint8_t tx_frame[MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+        int tx_failed = 0;
+
+        if (mlxnicd_rx_burst(dev, &rx_pkt, 1, (int)opts->timeout_ms) != 1) {
+            sample_report_dev_error("mlxnicd_rx_burst", dev);
+            goto out;
+        }
+        if (rx_pkt.len < 14 + MLXNICD_SAMPLE_BENCH_HDR_LEN ||
+            sample_get_be16(rx_pkt.data + 12) != ethertype ||
+            sample_get_be32(rx_pkt.data + 14) != MLXNICD_SAMPLE_BENCH_MAGIC) {
+            filtered++;
+            goto release;
+        }
+
+        flags = sample_get_be16(rx_pkt.data + 20);
+        if ((flags & MLXNICD_SAMPLE_BENCH_F_REPLY) != 0) {
+            already_reply++;
+            goto release;
+        }
+
+        if (rx_pkt.len > sizeof(tx_frame)) {
+            filtered++;
+            goto release;
+        }
+        memcpy(tx_frame, rx_pkt.data, rx_pkt.len);
+        memcpy(mac, tx_frame, sizeof(mac));
+        memcpy(tx_frame, tx_frame + 6, sizeof(mac));
+        memcpy(tx_frame + 6, mac, sizeof(mac));
+        sample_put_be16(tx_frame + 20,
+                        flags | MLXNICD_SAMPLE_BENCH_F_REPLY);
+        tx_pkt.data = tx_frame;
+        tx_pkt.len = rx_pkt.len;
+        if (mlxnicd_tx_burst(dev, &tx_pkt, 1) != 1) {
+            sample_report_dev_error("mlxnicd_tx_burst", dev);
+            tx_failed = 1;
+            goto release;
+        }
+        echoed++;
+        if (opts->verbose) {
+            fprintf(stdout, "raw-echo: echoed seq=%" PRIu32 " len=%" PRIu32
+                            " flags=0x%04" PRIx16 "\n",
+                    sample_get_be32(rx_pkt.data + 22), rx_pkt.len,
+                    sample_get_be16(tx_frame + 20));
+        }
+
+release:
+        if (mlxnicd_rx_release(dev, 1) != 0) {
+            sample_report_dev_error("mlxnicd_rx_release", dev);
+            goto out;
+        }
+        if (tx_failed) {
+            goto out;
+        }
+    }
+
+    rc = 0;
+
+out:
+    mlxnicd_dev_close(dev);
+    fprintf(stdout,
+            "raw-echo: %s echoed=%" PRIu32 " filtered=%" PRIu32
+            " already_reply=%" PRIu32 "\n",
+            rc == 0 ? "ok" : "failed", echoed, filtered, already_reply);
+    return rc;
+}
+
 int sample_raw_bench(const struct raw_bench_opts *opts) {
     struct mlxnicd_dev *dev = NULL;
     struct mlxnicd_dev_config config;
@@ -755,7 +882,8 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
                 if (sample_bench_parse_frame(opts, &rx_pkt, &seq, &pkt_send_ns,
                                              &flags) != 0) {
                     stats.filtered_frames++;
-                } else if ((flags & MLXNICD_SAMPLE_BENCH_F_REPLY) == 0) {
+                } else if ((flags & MLXNICD_SAMPLE_BENCH_F_REPLY) == 0 &&
+                           !sample_bench_is_l2_reflection(opts, &rx_pkt)) {
                     stats.local_frames++;
                 } else {
                     uint64_t rtt_ns;
@@ -794,43 +922,58 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
 
     while (received < opts->packet_count) {
         while (sent < opts->packet_count && inflight < opts->window) {
-            int slot_index = sample_bench_slot_alloc(slots, opts->window);
-            uint64_t send_ns = sample_now_ns();
-            uint32_t frame_len = 0;
+            struct mlxnicd_pkt tx_batch[MLXNICD_SAMPLE_BENCH_MAX_WINDOW] = {{0}};
+            uint8_t tx_frames[MLXNICD_SAMPLE_BENCH_MAX_WINDOW]
+                             [MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+            uint64_t send_times[MLXNICD_SAMPLE_BENCH_MAX_WINDOW] = {0};
+            uint32_t frame_lens[MLXNICD_SAMPLE_BENCH_MAX_WINDOW] = {0};
+            uint32_t batch = 0;
 
-            if (slot_index < 0) {
-                fprintf(stderr, "raw-bench: no free inflight slot\n");
-                goto out;
+            while (batch < opts->window - inflight &&
+                   sent + batch < opts->packet_count) {
+                int slot_index = sample_bench_slot_alloc(slots, opts->window);
+
+                if (slot_index < 0) {
+                    fprintf(stderr, "raw-bench: no free inflight slot\n");
+                    goto out;
+                }
+                send_times[batch] = sample_now_ns();
+                if (sample_bench_build_frame(opts, sent + batch,
+                                             send_times[batch], 0,
+                                             tx_frames[batch],
+                                             sizeof(tx_frames[batch]),
+                                             &frame_lens[batch]) != 0) {
+                    goto out;
+                }
+                tx_batch[batch].data = tx_frames[batch];
+                tx_batch[batch].len = frame_lens[batch];
+                slots[slot_index].seq = sent + batch;
+                slots[slot_index].send_ns = send_times[batch];
+                slots[slot_index].active = 1;
+                batch++;
             }
-            if (sample_bench_build_frame(opts, sent, send_ns, 0, frame,
-                                         sizeof(frame), &frame_len) != 0) {
-                goto out;
-            }
-            tx_pkt.data = frame;
-            tx_pkt.len = frame_len;
-            if (mlxnicd_tx_burst(dev, &tx_pkt, 1) != 1) {
+            if (mlxnicd_tx_burst(dev, tx_batch, (uint16_t)batch) != batch) {
                 sample_report_dev_error("mlxnicd_tx_burst", dev);
                 goto out;
             }
-            slots[slot_index].seq = sent;
-            slots[slot_index].send_ns = send_ns;
-            slots[slot_index].active = 1;
-            inflight++;
-            stats.tx_bytes += frame_len;
-            if (stats.tx_first_ns == 0) {
-                stats.tx_first_ns = send_ns;
+            for (uint32_t i = 0; i < batch; i++) {
+                inflight++;
+                stats.tx_bytes += frame_lens[i];
+                if (stats.tx_first_ns == 0) {
+                    stats.tx_first_ns = send_times[i];
+                }
+                stats.tx_last_ns = send_times[i];
+                if (opts->verbose) {
+                    fprintf(stdout,
+                            "raw-bench: tx seq=%" PRIu32 " len=%" PRIu32
+                            " inflight=%" PRIu32 " hdr_seq=%" PRIu32
+                            " hdr_flags=0x%04" PRIx16 "\n",
+                            sent + i, frame_lens[i], inflight,
+                            sample_get_be32(tx_frames[i] + 22),
+                            sample_get_be16(tx_frames[i] + 20));
+                }
             }
-            stats.tx_last_ns = send_ns;
-            if (opts->verbose) {
-                fprintf(stdout,
-                        "raw-bench: tx seq=%" PRIu32 " len=%" PRIu32
-                        " inflight=%" PRIu32 " hdr_seq=%" PRIu32
-                        " hdr_flags=0x%04" PRIx16 "\n",
-                        sent, frame_len, inflight,
-                        sample_get_be32(frame + 22),
-                        sample_get_be16(frame + 20));
-            }
-            sent++;
+            sent += batch;
         }
 
         {
@@ -865,7 +1008,8 @@ int sample_raw_bench(const struct raw_bench_opts *opts) {
                             rx_pkt.len);
                 }
             } else {
-                if ((flags & MLXNICD_SAMPLE_BENCH_F_REPLY) == 0) {
+                if ((flags & MLXNICD_SAMPLE_BENCH_F_REPLY) == 0 &&
+                    !sample_bench_is_l2_reflection(opts, &rx_pkt)) {
                     stats.local_frames++;
                     if (opts->verbose) {
                         fprintf(stdout,

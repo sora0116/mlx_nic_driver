@@ -1132,3 +1132,94 @@ Next raw-loop-specific steps:
    filter model.
 3. If this needs to become a reusable tool rather than a test command, separate
    protocol-independent RX/TX primitives from the current test harness.
+
+## Benchmark update (2026-07-14)
+
+`raw-bench` now uses separate TX/RX CQs, a 256-WQEBB SQ, a 256-entry RQ and
+256-entry CQs. SQ/CQ DMA memory is a four-page (16 KiB) contiguous VFIO mapping
+with four PAS entries. Full-inline frames consume two SQ WQEBBs, so the supported
+benchmark window is at most 128.
+
+The TX path prepares a whole API burst, updates the SQ doorbell record once,
+rings one doorbell using the last WQE, then waits for the final signalled TX CQE.
+CQ polling busy-spins before falling back to a 1 ms sleep. The spin path is
+intentional for this benchmark but consumes one CPU while traffic is active.
+
+Validated command:
+
+```sh
+ssh sdn-svr5 'cd /tmp/mlxnicd && sudo nohup python3 raw_bench_echo.py \
+  --ifname eth2 --ethertype 0x88b5 --count 100000 \
+  >/tmp/raw_bench_echo.log 2>&1 </dev/null &'
+
+ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-bench \
+  --bdf 0000:01:00.0 --peer-if eth2 \
+  --src-mac 02:00:00:00:00:06 --dst-mac ff:ff:ff:ff:ff:ff \
+  --ethertype 0x88b5 --count 100000 --window 128 \
+  --timeout-ms 10000 --min-rtt-ns 10000'
+```
+
+Observed result with the Python helper: `tx=100000 rx=100000 filtered=0
+local=100000`, average RTT about 698 us and end-to-end about 0.183 Mpps /
+0.088 Gbps.
+
+DPDK is installed on `sdn-svr5`. `eth2` is `0000:01:00.1` and can be used by
+the mlx5 PMD while `mlx5_core` remains bound. A verified faster peer is:
+
+```sh
+ssh sdn-svr5 "setsid -f sh -c 'tail -f /dev/null | sudo dpdk-testpmd \
+  -l 1,2 -n 4 -a 0000:01:00.1 -- \
+  --nb-cores=1 --forward-mode=macswap --port-topology=loop --auto-start' \
+  >/tmp/testpmd-mlxnicd.log 2>&1"
+```
+
+The benchmark accepts either its normal reply flag or a packet whose L2 source
+and destination MACs are the exact reverse of the transmitted frame; the latter
+makes DPDK `macswap` usable without changing the benchmark payload. With this
+testpmd setup, 100,000 packets at window 128 completed with average RTT about
+409 us and end-to-end about 0.312 Mpps / 0.150 Gbps. Stop it with
+`sudo pkill -f dpdk-testpmd` after the measurement.
+
+The most recent rerun after the IOMMU investigation used the same command and
+completed with `tx=100000 rx=100000 filtered=0 local=100000 unmatched=0`, a
+minimum/average/maximum RTT of `151879 / 406970.6 / 533743 ns`, and an
+end-to-end rate of `0.314 Mpps / 0.151 Gbps`. `dpdk-testpmd` used one forwarding
+core at approximately 98% CPU. Keep this process as the temporary peer while
+`sdn-svr5` cannot be bound to VFIO; stop it with `sudo kill $(pgrep -x
+dpdk-testpmd)` rather than `pkill -f` from a shell command that itself contains
+the `dpdk-testpmd` string.
+
+## Self-driver benchmark path (2026-07-14)
+
+`raw-echo` was added to remove Python and DPDK from the peer forwarding path.
+It owns a VFIO-bound NIC through the public `mlxnicd` API, receives a
+`raw-bench` request, verifies the configured EtherType and benchmark magic,
+copies the received frame into a TX frame, swaps the L2 MAC addresses, sets
+`MLXNICD_SAMPLE_BENCH_F_REPLY`, and transmits it. It rejects unrelated frames
+and skips its own reflected reply frames.
+
+The intended measurement path is:
+
+```text
+raw-bench / sdn-svr6 / 0000:01:00.0
+  -> mlxnicd TX -> physical link -> mlxnicd RX/TX / sdn-svr5 / 0000:01:00.1
+  -> physical link -> mlxnicd RX -> raw-bench
+```
+
+This isolates both endpoint data paths to this repository. `raw-echo` currently
+uses one `mlxnicd_rx_burst(..., 1, ...)` and one `mlxnicd_tx_burst(..., 1)` per
+request, so its RX poll, frame copy, WQE construction and TX-completion wait are
+expected to be the first in-repository throughput limit. Do not compare its
+result directly with `testpmd` until peer-side burst reflection has been added.
+
+Deployment requires both functions to have IOMMU groups and be bound to
+`vfio-pci`. On 2026-07-14, `sdn-svr6` satisfies this (`intel_iommu=on iommu=pt`,
+group 15), but `sdn-svr5` cannot yet do so. Its boot setting was changed from
+`intel_iommu=off` to `intel_iommu=on iommu=pt` and the host was rebooted, so
+`dmesg` now reports `DMAR: IOMMU enabled`. Nevertheless,
+`/sys/kernel/iommu_groups` still has zero groups, no PCI device has an
+`iommu_group` symlink, and the ACPI `DMAR` table is unavailable. Consequently
+`./mlxnicd vfio-check 0000:01:00.1` correctly reports `status: not ready`.
+Enable Intel VT-d/IOMMU in `sdn-svr5` firmware (and confirm firmware exports a
+DMAR table), reboot, then verify that `0000:01:00.1` has a nonempty IOMMU group
+before executing `vfio-bind`.

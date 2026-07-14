@@ -30,7 +30,18 @@ struct raw_bench_opts {
     int verbose;
 };
 
+/* Reflect raw-bench request frames using the same userspace driver. */
+struct raw_echo_opts {
+    const char *bdf;
+    const char *peer_if;
+    const char *ethertype;
+    uint32_t packet_count;
+    uint32_t timeout_ms;
+    int verbose;
+};
+
 int raw_loop_run(const struct raw_loop_opts *opts);
 int raw_bench_run(const struct raw_bench_opts *opts);
+int raw_echo_run(const struct raw_echo_opts *opts);
 
 #endif

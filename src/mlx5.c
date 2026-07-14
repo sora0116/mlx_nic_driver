@@ -112,10 +112,10 @@ enum {
     MLX5_CREATE_EQ_IN_SIZE = 0x118,
     MLX5_CREATE_EQ_EQC_OFF = 0x10,
     MLX5_CREATE_EQ_PAS_OFF = 0x110,
-    MLX5_CREATE_CQ_IN_SIZE = 0x118,
+    MLX5_CREATE_CQ_IN_SIZE = 0x130,
     MLX5_CREATE_CQ_CQC_OFF = 0x10,
     MLX5_CREATE_CQ_PAS_OFF = 0x110,
-    MLX5_CREATE_SQ_IN_SIZE = 0x118,
+    MLX5_CREATE_SQ_IN_SIZE = 0x130,
     MLX5_CREATE_SQ_SQC_OFF = 0x20,
     MLX5_SQC_WQ_OFF = 0x30,
     MLX5_CREATE_SQ_PAS_OFF = 0x110,
@@ -148,10 +148,10 @@ enum {
     MLX5_SET_FTE_IN_SIZE = 0x348,
     MLX5_UAR_PAGE_SIZE = 4096,
     MLX5_BF_OFFSET = 0x800,
-    MLX5_CQ_CQE_COUNT = 16,
+    MLX5_CQ_CQE_COUNT = 256,
     MLX5_CQE_SIZE = 64,
-    MLX5_SQ_WQE_COUNT = 16,
-    MLX5_RQ_WQE_COUNT = 16,
+    MLX5_SQ_WQE_COUNT = 256,
+    MLX5_RQ_WQE_COUNT = 256,
     MLX5_WQ_TYPE_CYCLIC = 1,
     MLX5_SEND_WQE_BB_LOG = 6,
     MLX5_SQC_STATE_RST = 0,
@@ -164,6 +164,7 @@ enum {
     MLX5_WQE_CTRL_CQ_UPDATE = 2 << 2,
     MLX5_CQE_REQ_ERR = 13,
     MLX5_CQE_RESP_ERR = 14,
+    MLX5_CQ_FAST_POLL_SPINS = 1000000,
     MLX5_TX_TEST_MIN_FRAME = 60,
     MLX5_TX_TEST_MAX_INLINE_FRAME = 98,
     MLX5_RX_BUFFER_SIZE = 2048,
@@ -180,6 +181,7 @@ enum {
 struct mlx5_dma_page {
     void *addr;
     uint64_t iova;
+    size_t len;
 };
 
 struct mlx5_eq_res {
@@ -447,16 +449,17 @@ static int alloc_aligned_zero(void **ptr, size_t size) {
     return 0;
 }
 
-static int mlx5_dma_page_alloc(struct mlx5_cmd_ctx *ctx,
-                               struct mlx5_dma_page *page, uint64_t iova,
-                               const char *name) {
+static int mlx5_dma_region_alloc(struct mlx5_cmd_ctx *ctx,
+                                 struct mlx5_dma_page *page, uint64_t iova,
+                                 size_t len, const char *name) {
     memset(page, 0, sizeof(*page));
     page->iova = iova;
-    if (alloc_aligned_zero(&page->addr, 4096) != 0) {
-        fprintf(stderr, "failed to allocate %s DMA page\n", name);
+    page->len = len;
+    if (alloc_aligned_zero(&page->addr, len) != 0) {
+        fprintf(stderr, "failed to allocate %s DMA region\n", name);
         return -1;
     }
-    if (vfio_dma_map(&ctx->dev, page->addr, page->iova, 4096) != 0) {
+    if (vfio_dma_map(&ctx->dev, page->addr, page->iova, len) != 0) {
         free(page->addr);
         memset(page, 0, sizeof(*page));
         return -1;
@@ -464,10 +467,16 @@ static int mlx5_dma_page_alloc(struct mlx5_cmd_ctx *ctx,
     return 0;
 }
 
+static int mlx5_dma_page_alloc(struct mlx5_cmd_ctx *ctx,
+                               struct mlx5_dma_page *page, uint64_t iova,
+                               const char *name) {
+    return mlx5_dma_region_alloc(ctx, page, iova, 4096, name);
+}
+
 static void mlx5_dma_page_free(struct mlx5_cmd_ctx *ctx,
                                struct mlx5_dma_page *page) {
     if (page->addr != NULL) {
-        vfio_dma_unmap(&ctx->dev, page->iova, 4096);
+        vfio_dma_unmap(&ctx->dev, page->iova, page->len);
         free(page->addr);
     }
     memset(page, 0, sizeof(*page));
@@ -1197,17 +1206,17 @@ static int mlx5_ctx_create_cq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
         fprintf(stderr, "cannot create CQ without a valid EQ\n");
         return -1;
     }
-    if (mlx5_dma_page_alloc(ctx, &cq->cq_page, cq_iova, "CQ") != 0) {
+    if (mlx5_dma_region_alloc(ctx, &cq->cq_page, cq_iova, 16384, "CQ") != 0) {
         return -1;
     }
-    memset(cq->cq_page.addr, 0xff, 4096);
+    memset(cq->cq_page.addr, 0xff, cq->cq_page.len);
     if (mlx5_dma_page_alloc(ctx, &cq->dbr_page, dbr_iova, "CQ DBR") != 0) {
         mlx5_dma_page_free(ctx, &cq->cq_page);
         return -1;
     }
 
     put_be16(in, MLX5_CMD_OP_CREATE_CQ);
-    cqc[0x0c] = 4;                 /* log_cq_size=4 => 16 CQEs */
+    cqc[0x0c] = 8;                 /* log_cq_size=8 => 256 CQEs */
     cqc[0x0d] = (uint8_t)(uar >> 16);
     cqc[0x0e] = (uint8_t)(uar >> 8);
     cqc[0x0f] = (uint8_t)uar;
@@ -1215,6 +1224,9 @@ static int mlx5_ctx_create_cq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
     cqc[0x18] = 0;                 /* log_page_size=0 => 4KB */
     put_be64(cqc + 0x38, cq->dbr_page.iova); /* dbr_addr */
     put_be64(in + MLX5_CREATE_CQ_PAS_OFF, cq->cq_page.iova);
+    put_be64(in + MLX5_CREATE_CQ_PAS_OFF + 8, cq->cq_page.iova + 4096);
+    put_be64(in + MLX5_CREATE_CQ_PAS_OFF + 16, cq->cq_page.iova + 8192);
+    put_be64(in + MLX5_CREATE_CQ_PAS_OFF + 24, cq->cq_page.iova + 12288);
 
     rc = mlx5_cmd_exec(ctx, MLX5_CMD_OP_CREATE_CQ, in, sizeof(in), out,
                        sizeof(out), "seq-create-cq");
@@ -1272,7 +1284,7 @@ static int mlx5_ctx_create_sq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
         fprintf(stderr, "cannot create SQ without a valid CQ\n");
         return -1;
     }
-    if (mlx5_dma_page_alloc(ctx, &sq->sq_page, sq_iova, "SQ") != 0) {
+    if (mlx5_dma_region_alloc(ctx, &sq->sq_page, sq_iova, 16384, "SQ") != 0) {
         return -1;
     }
     if (mlx5_dma_page_alloc(ctx, &sq->dbr_page, dbr_iova, "SQ DBR") != 0) {
@@ -1296,8 +1308,11 @@ static int mlx5_ctx_create_sq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
     put_be32(wq + 0x0c, uar & 0x00ffffffu);
     put_be64(wq + 0x10, sq->dbr_page.iova);
     wq[0x21] = MLX5_SEND_WQE_BB_LOG; /* log_wq_stride=6 => 64B */
-    wq[0x23] = 4;                    /* log_wq_sz=4 => 16 WQEBBs */
+    wq[0x23] = 8;                    /* log_wq_sz=8 => 256 WQEBBs */
     put_be64(in + MLX5_CREATE_SQ_PAS_OFF, sq->sq_page.iova);
+    put_be64(in + MLX5_CREATE_SQ_PAS_OFF + 8, sq->sq_page.iova + 4096);
+    put_be64(in + MLX5_CREATE_SQ_PAS_OFF + 16, sq->sq_page.iova + 8192);
+    put_be64(in + MLX5_CREATE_SQ_PAS_OFF + 24, sq->sq_page.iova + 12288);
 
     rc = mlx5_cmd_exec(ctx, MLX5_CMD_OP_CREATE_SQ, in, sizeof(in), out,
                        sizeof(out), "seq-create-sq");
@@ -1373,7 +1388,7 @@ static int mlx5_ctx_create_rq(struct mlx5_cmd_ctx *ctx, uint32_t pd,
     put_be32(wq + 0x08, pd & 0x00ffffffu);
     put_be64(wq + 0x10, rq->dbr_page.iova);
     wq[0x21] = 4; /* log_wq_stride=4 => 16B cyclic receive WQE */
-    wq[0x23] = 4; /* log_wq_sz=4 => 16 entries */
+    wq[0x23] = 8; /* log_wq_sz=8 => 256 entries */
     put_be64(in + MLX5_CREATE_RQ_PAS_OFF, rq->rq_page.iova);
 
     rc = mlx5_cmd_exec(ctx, MLX5_CMD_OP_CREATE_RQ, in, sizeof(in), out,
@@ -2039,6 +2054,7 @@ static int mlx5_poll_cq(struct mlx5_cq_res *cq, const char *tag,
                         int timeout_ms, uint32_t *byte_cnt_out,
                         uint16_t *wqe_counter_out) {
     int elapsed = 0;
+    unsigned int spins = MLX5_CQ_FAST_POLL_SPINS;
 
     while (elapsed <= timeout_ms) {
         int got =
@@ -2049,8 +2065,13 @@ static int mlx5_poll_cq(struct mlx5_cq_res *cq, const char *tag,
         if (got < 0) {
             return -1;
         }
+        /* Fast-path TX/RX completions without adding a scheduler-sized delay. */
+        if (spins-- != 0) {
+            continue;
+        }
         sleep_ms(1);
         elapsed++;
+        spins = MLX5_CQ_FAST_POLL_SPINS;
     }
 
     fprintf(stderr, "%s timeout waiting for CQE\n", tag);
@@ -2325,15 +2346,14 @@ trim_trailing_zero_bytes(const uint8_t *buf, size_t len, size_t min_len) {
     return len;
 }
 
-static int mlx5_sq_post_send_raw(struct mlx5_cmd_ctx *ctx, uint32_t uar,
-                                 uint32_t tisn, uint32_t mkey,
-                                 struct mlx5_cq_res *cq,
-                                 struct mlx5_sq_res *sq, const uint8_t *frame,
-                                 size_t frame_len) {
+static int mlx5_sq_prepare_send_raw(uint32_t tisn, uint32_t mkey,
+                                    struct mlx5_sq_res *sq,
+                                    const uint8_t *frame, size_t frame_len,
+                                    int request_completion,
+                                    uint8_t **wqe_out) {
     uint8_t *wqe = (uint8_t *)sq->sq_page.addr +
                    ((sq->prod_index & (MLX5_SQ_WQE_COUNT - 1)) <<
                     MLX5_SEND_WQE_BB_LOG);
-    uint64_t uar_off = ((uint64_t)uar * MLX5_UAR_PAGE_SIZE) + MLX5_BF_OFFSET;
     uint32_t pi = sq->prod_index;
     uint32_t ds;
     uint32_t wqebbs;
@@ -2352,6 +2372,32 @@ static int mlx5_sq_post_send_raw(struct mlx5_cmd_ctx *ctx, uint32_t uar,
                 ds, wqebbs);
         return -1;
     }
+    memset(wqe, 0, wqebbs << MLX5_SEND_WQE_BB_LOG);
+    put_be32(wqe + 0x00, ((pi & 0xffffu) << 8) | MLX5_OPCODE_SEND);
+    put_be32(wqe + 0x04, ((sq->sqn & 0x00ffffffu) << 8) | ds);
+    wqe[0x0b] = request_completion ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+    put_be32(wqe + 0x0c, tisn & 0x00ffffffu);
+
+    put_be16(wqe + 0x1c, (uint16_t)frame_len);
+    memcpy(wqe + 0x1e, frame, 2);
+    memcpy(wqe + 0x20, frame + 2, frame_len - 2);
+
+    sq->prod_index += wqebbs;
+    printf("  prepare SEND WQE: sqn=%" PRIu32 " tisn=%" PRIu32
+           " inline_len=%zu pi=%" PRIu32 " new_pi=%" PRIu32
+           " completion=%d\n",
+           sq->sqn, tisn, frame_len, pi, sq->prod_index, request_completion);
+    dump_hex("  send frame", frame, frame_len);
+    dump_hex("  send wqe", wqe, wqebbs << MLX5_SEND_WQE_BB_LOG);
+    *wqe_out = wqe;
+    return 0;
+}
+
+static int mlx5_sq_ring_send(struct mlx5_cmd_ctx *ctx, uint32_t uar,
+                             struct mlx5_cq_res *cq,
+                             struct mlx5_sq_res *sq, const uint8_t *last_wqe) {
+    uint64_t uar_off = ((uint64_t)uar * MLX5_UAR_PAGE_SIZE) + MLX5_BF_OFFSET;
+
     if (uar_off + 8 > ctx->dev.bar0_size) {
         fprintf(stderr,
                 "UAR BF offset outside BAR0: uar=%" PRIu32
@@ -2360,37 +2406,18 @@ static int mlx5_sq_post_send_raw(struct mlx5_cmd_ctx *ctx, uint32_t uar,
         return -1;
     }
 
-    memset(wqe, 0, wqebbs << MLX5_SEND_WQE_BB_LOG);
-    put_be32(wqe + 0x00, (pi << 8) | MLX5_OPCODE_SEND);
-    put_be32(wqe + 0x04, ((sq->sqn & 0x00ffffffu) << 8) | ds);
-    wqe[0x0b] = MLX5_WQE_CTRL_CQ_UPDATE;
-    put_be32(wqe + 0x0c, tisn & 0x00ffffffu);
-
-    put_be16(wqe + 0x1c, (uint16_t)frame_len);
-    memcpy(wqe + 0x1e, frame, 2);
-    memcpy(wqe + 0x20, frame + 2, frame_len - 2);
-
+    /* Publish all WQEs before advancing the SQ producer and doorbell. */
     __sync_synchronize();
-    sq->prod_index += wqebbs;
-    put_be32((uint8_t *)sq->dbr_page.addr + 4, sq->prod_index & 0x00ffffffu);
+    put_be32((uint8_t *)sq->dbr_page.addr + 4, sq->prod_index & 0xffffu);
     __sync_synchronize();
-
-    printf("  post SEND WQE: sqn=%" PRIu32 " tisn=%" PRIu32
-           " inline_len=%zu pi=%" PRIu32
-           " new_pi=%" PRIu32 " uar_off=0x%" PRIx64 "\n",
-           sq->sqn, tisn, frame_len, pi, sq->prod_index, uar_off);
-    dump_hex("  send frame", frame, frame_len);
-    dump_hex("  send wqe", wqe, wqebbs << MLX5_SEND_WQE_BB_LOG);
-
     {
         uint64_t word;
 
-        memcpy(&word, wqe, sizeof(word));
+        memcpy(&word, last_wqe, sizeof(word));
         mmio_write64_native(ctx->dev.bar0, uar_off, word);
     }
     __sync_synchronize();
-
-    return mlx5_poll_cq(cq, "seq-post-send", 1000, NULL, NULL);
+    return mlx5_poll_cq(cq, "seq-post-send-batch", 1000, NULL, NULL);
 }
 
 static int mlx5_ctx_set_hca_cap_raw(struct mlx5_cmd_ctx *ctx, uint16_t cap_type,
@@ -2807,7 +2834,7 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
     }
     if (want_rx) {
         rc = mlx5_ctx_create_cq(&rt->ctx, rt->uar, &rt->eq, &rt->rx_cq,
-                                0x07a00000ULL, 0x07b00000ULL);
+                                0x08100000ULL, 0x08200000ULL);
         if (rc != 0) {
             goto out;
         }
@@ -2879,14 +2906,30 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
     }
 
     while (sent < nb_pkts) {
-        int rc = mlx5_sq_post_send_raw(&dev->rt.ctx, dev->rt.uar, dev->rt.tisn,
-                                       dev->rt.mkey, &dev->rt.tx_cq, &dev->rt.sq,
-                                       pkts[sent].data, pkts[sent].len);
-        if (rc != 0) {
-            dev->last_error = mlxnicd_err_from_rc(rc);
-            break;
+        uint16_t batch = nb_pkts - sent;
+        uint8_t *last_wqe = NULL;
+
+        /* Each supported full-inline frame consumes two of 256 SQ WQEBBs. */
+        if (batch > MLX5_SQ_WQE_COUNT / 2) {
+            batch = MLX5_SQ_WQE_COUNT / 2;
         }
-        sent++;
+        for (uint16_t i = 0; i < batch; i++) {
+            int rc = mlx5_sq_prepare_send_raw(dev->rt.tisn, dev->rt.mkey,
+                                               &dev->rt.sq,
+                                               pkts[sent + i].data,
+                                               pkts[sent + i].len,
+                                               i + 1 == batch, &last_wqe);
+            if (rc != 0) {
+                dev->last_error = mlxnicd_err_from_rc(rc);
+                return sent;
+            }
+        }
+        if (mlx5_sq_ring_send(&dev->rt.ctx, dev->rt.uar, &dev->rt.tx_cq,
+                              &dev->rt.sq, last_wqe) != 0) {
+            dev->last_error = MLXNICD_ERR_IO;
+            return sent;
+        }
+        sent = (uint16_t)(sent + batch);
     }
     if (sent == nb_pkts) {
         dev->last_error = MLXNICD_OK;

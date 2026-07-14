@@ -233,17 +233,74 @@ ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-bench \
   --src-mac 02:00:00:00:00:06 \
   --dst-mac ff:ff:ff:ff:ff:ff \
   --ethertype 0x88b5 \
-  --count 1000 \
-  --window 8 \
+  --count 100000 \
+  --window 128 \
   --timeout-ms 30000 \
   --min-rtt-ns 10000'
 ```
+
+`sdn-svr5:eth2` を DPDK peer forwarder として使う場合は、別 terminal で
+次を起動します。`macswap` は Ethernet source/destination MAC を交換して
+同一 port へ返すため、Python echo helper より低い overhead で使えます。
+
+```sh
+ssh sdn-svr5 "setsid -f sh -c 'tail -f /dev/null | sudo dpdk-testpmd \
+  -l 1,2 -n 4 -a 0000:01:00.1 -- \
+  --nb-cores=1 --forward-mode=macswap --port-topology=loop --auto-start' \
+  >/tmp/testpmd-mlxnicd.log 2>&1"
+```
+
+停止時は `ssh sdn-svr5 'sudo pkill -f dpdk-testpmd'` を実行します。
+
+### 自作 driver だけの peer (`raw-echo`)
+
+外部の Python/DPDK forwarding を除外して、この repository の RX、frame
+parse、TX、CQ polling だけを測りたい場合は、対向ポートも `vfio-pci` に bind
+し、`raw-echo` を起動する。`raw-echo` は benchmark request の EtherType と
+magic を確認し、Ethernet の source/destination MAC を交換して benchmark header
+の reply flag をセットして返す。従って往復経路は次の通りになる。
+
+```text
+sdn-svr6 raw-bench (mlxnicd) -> wire -> sdn-svr5 raw-echo (mlxnicd)
+                              <- wire <-
+```
+
+両ホストで VFIO/IOMMU が有効であることが前提である。実行例は以下の通り。
+
+```sh
+# sdn-svr5: eth2 のカーネル driver を停止して自作 driver に譲渡する
+ssh sdn-svr5 'cd ~/work/takagi/nicd && \
+  sudo ./mlxnicd vfio-bind 0000:01:00.1 && \
+  sudo nohup ./mlxnicd raw-echo \
+    --bdf 0000:01:00.1 --peer-if eth2 --ethertype 0x88b5 \
+    --count 100000 --timeout-ms 30000 \
+    >/tmp/mlxnicd-raw-echo.log 2>&1 </dev/null &'
+
+# sdn-svr6: same repository の raw-bench で測定する
+ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-bench \
+  --bdf 0000:01:00.0 --peer-if eth2 \
+  --src-mac 02:00:00:00:00:06 --dst-mac ff:ff:ff:ff:ff:ff \
+  --ethertype 0x88b5 --count 100000 --window 128 \
+  --timeout-ms 30000 --min-rtt-ns 10000'
+```
+
+このモードでは、`raw-echo` の 1 packet ごとの RX poll、frame copy、TX completion
+wait が意図的に結果へ含まれる。まずは正しさと repository 内の end-to-end
+bottleneck を特定するための基準であり、次の最適化対象は peer 側の burst reflection
+と TX completion の batching になる。
 
 注意点:
 
 - この driver は RX promisc を使うので、環境によっては自分で送った frame の local copy が先に見える
 - `raw-bench` は payload に埋めた `seq` / `send_time_ns` で戻り frame を識別し、`--min-rtt-ns` 未満の非常に短い応答を local copy とみなして除外する
-- `--window` は同時に outstanding にする benchmark frame 数で、full-inline の 1 frame が SQ の 64-byte WQEBB を 2 個消費するため、現状は `8` 以下を前提にしている
+- `--window` は同時に outstanding にする benchmark frame 数で、full-inline の 1 frame が SQ の 64-byte WQEBB を 2 個消費するため、現状は `128` 以下を前提にしている
+
+2026-07-14 の最新実機確認（`sdn-svr6` / `sdn-svr5`、DPDK `testpmd`
+macswap、100,000 packets、`--window 128`）では、`tx=100000 rx=100000
+filtered=0`、平均 RTT は 407 µs、end-to-end は 0.314 Mpps / 0.151 Gbps
+でした。Python echo helper では約 0.183 Mpps / 0.088 Gbps でした。CQ は最初に
+busy-poll してから 1 ms sleep に移るため、ベンチマーク中は送信側 CPU を1コア
+消費します。
 
 期待される結果の要点:
 

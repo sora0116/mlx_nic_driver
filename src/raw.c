@@ -48,3 +48,24 @@ int raw_bench_run(const struct raw_bench_opts *opts) {
 
     return sample_raw_bench(opts);
 }
+
+int raw_echo_run(const struct raw_echo_opts *opts) {
+    int bad = 0;
+
+    bad |= missing("--bdf", opts->bdf);
+    bad |= missing("--peer-if", opts->peer_if);
+    bad |= missing("--ethertype", opts->ethertype);
+    if (opts->packet_count == 0) {
+        fprintf(stderr, "--count must be greater than zero\n");
+        bad = 1;
+    }
+    if (opts->timeout_ms == 0) {
+        fprintf(stderr, "--timeout-ms must be greater than zero\n");
+        bad = 1;
+    }
+    if (bad) {
+        return -1;
+    }
+
+    return sample_raw_echo(opts);
+}

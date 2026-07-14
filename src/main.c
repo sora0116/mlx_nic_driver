@@ -31,6 +31,7 @@ static void usage(FILE *out, const char *argv0) {
             "  %s mlx5-query-hca-cap <BDF>\n"
             "  %s raw-loop --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--rx-count N] [--pre-rx-delay-ms N] [--timeout-ms N] [--verbose]\n"
             "  %s raw-bench --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--count N] [--window N] [--timeout-ms N] [--min-rtt-ns N] [--verbose]\n"
+            "  %s raw-echo --bdf <BDF> --peer-if <ifname> --ethertype <hex> [--count N] [--timeout-ms N] [--verbose]\n"
             "\n"
             "examples:\n"
             "  %s list\n"
@@ -38,7 +39,7 @@ static void usage(FILE *out, const char *argv0) {
             "  %s bar-read 0000:01:00.0 0 0x0 32\n",
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-            argv0, argv0,
+            argv0, argv0, argv0,
             argv0, argv0, argv0, argv0);
 }
 
@@ -337,6 +338,32 @@ int main(int argc, char **argv) {
         opts.min_rtt_ns = min_rtt_ns;
         opts.verbose = opt_present(argc, argv, "--verbose");
         return raw_bench_run(&opts) == 0 ? 0 : 1;
+    }
+
+    if (strcmp(argv[1], "raw-echo") == 0) {
+        struct raw_echo_opts opts;
+        uint32_t count = 1000;
+        uint32_t timeout_ms = 30000;
+        const char *count_s = opt_value(argc, argv, "--count");
+        const char *timeout_ms_s = opt_value(argc, argv, "--timeout-ms");
+
+        if (count_s != NULL && parse_u32(count_s, &count) != 0) {
+            fprintf(stderr, "invalid --count: %s\n", count_s);
+            return 2;
+        }
+        if (timeout_ms_s != NULL &&
+            parse_u32(timeout_ms_s, &timeout_ms) != 0) {
+            fprintf(stderr, "invalid --timeout-ms: %s\n", timeout_ms_s);
+            return 2;
+        }
+        memset(&opts, 0, sizeof(opts));
+        opts.bdf = opt_value(argc, argv, "--bdf");
+        opts.peer_if = opt_value(argc, argv, "--peer-if");
+        opts.ethertype = opt_value(argc, argv, "--ethertype");
+        opts.packet_count = count;
+        opts.timeout_ms = timeout_ms;
+        opts.verbose = opt_present(argc, argv, "--verbose");
+        return raw_echo_run(&opts) == 0 ? 0 : 1;
     }
 
     usage(stderr, argv[0]);
