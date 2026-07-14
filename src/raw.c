@@ -25,3 +25,26 @@ int raw_loop_run(const struct raw_loop_opts *opts) {
 
     return sample_raw_loop(opts);
 }
+
+int raw_bench_run(const struct raw_bench_opts *opts) {
+    int bad = 0;
+
+    bad |= missing("--bdf", opts->bdf);
+    bad |= missing("--peer-if", opts->peer_if);
+    bad |= missing("--src-mac", opts->src_mac);
+    bad |= missing("--dst-mac", opts->dst_mac);
+    bad |= missing("--ethertype", opts->ethertype);
+    if (opts->packet_count == 0) {
+        fprintf(stderr, "--count must be greater than zero\n");
+        bad = 1;
+    }
+    if (opts->window == 0) {
+        fprintf(stderr, "--window must be greater than zero\n");
+        bad = 1;
+    }
+    if (bad) {
+        return -1;
+    }
+
+    return sample_raw_bench(opts);
+}

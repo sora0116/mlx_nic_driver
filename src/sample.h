@@ -13,5 +13,6 @@ int sample_mlx5_rx_post_test(const char *bdf);
 int sample_mlx5_rx_steer_test(const char *bdf);
 int sample_mlx5_rx_wait_test(const char *bdf);
 int sample_raw_loop(const struct raw_loop_opts *opts);
+int sample_raw_bench(const struct raw_bench_opts *opts);
 
 #endif

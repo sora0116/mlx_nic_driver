@@ -16,6 +16,21 @@ struct raw_loop_opts {
     uint32_t timeout_ms;
 };
 
+struct raw_bench_opts {
+    const char *bdf;
+    const char *peer_if;
+    const char *src_mac;
+    const char *dst_mac;
+    const char *ethertype;
+    const char *payload_hex;
+    uint32_t packet_count;
+    uint32_t window;
+    uint32_t timeout_ms;
+    uint32_t min_rtt_ns;
+    int verbose;
+};
+
 int raw_loop_run(const struct raw_loop_opts *opts);
+int raw_bench_run(const struct raw_bench_opts *opts);
 
 #endif

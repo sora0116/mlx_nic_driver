@@ -30,6 +30,7 @@ static void usage(FILE *out, const char *argv0) {
             "  %s mlx5-rx-wait-test <BDF>\n"
             "  %s mlx5-query-hca-cap <BDF>\n"
             "  %s raw-loop --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--rx-count N] [--pre-rx-delay-ms N] [--timeout-ms N] [--verbose]\n"
+            "  %s raw-bench --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--count N] [--window N] [--timeout-ms N] [--min-rtt-ns N] [--verbose]\n"
             "\n"
             "examples:\n"
             "  %s list\n"
@@ -37,7 +38,7 @@ static void usage(FILE *out, const char *argv0) {
             "  %s bar-read 0000:01:00.0 0 0x0 32\n",
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-            argv0,
+            argv0, argv0,
             argv0, argv0, argv0, argv0);
 }
 
@@ -49,6 +50,17 @@ static const char *opt_value(int argc, char **argv, const char *name) {
         }
     }
     return NULL;
+}
+
+static int opt_present(int argc, char **argv, const char *name) {
+    int i;
+
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -257,7 +269,7 @@ int main(int argc, char **argv) {
         opts.dst_mac = opt_value(argc, argv, "--dst-mac");
         opts.ethertype = opt_value(argc, argv, "--ethertype");
         opts.payload_hex = opt_value(argc, argv, "--payload-hex");
-        opts.verbose = opt_value(argc, argv, "--verbose") != NULL;
+        opts.verbose = opt_present(argc, argv, "--verbose");
         {
             const char *rx_count_s = opt_value(argc, argv, "--rx-count");
             const char *pre_rx_delay_ms_s =
@@ -281,6 +293,50 @@ int main(int argc, char **argv) {
             }
         }
         return raw_loop_run(&opts) == 0 ? 0 : 1;
+    }
+
+    if (strcmp(argv[1], "raw-bench") == 0) {
+        struct raw_bench_opts opts;
+        uint32_t count = 1000;
+        uint32_t window = 8;
+        uint32_t timeout_ms = 30000;
+        uint32_t min_rtt_ns = 10000;
+        const char *count_s = opt_value(argc, argv, "--count");
+        const char *window_s = opt_value(argc, argv, "--window");
+        const char *timeout_ms_s = opt_value(argc, argv, "--timeout-ms");
+        const char *min_rtt_ns_s = opt_value(argc, argv, "--min-rtt-ns");
+
+        memset(&opts, 0, sizeof(opts));
+        if (count_s != NULL && parse_u32(count_s, &count) != 0) {
+            fprintf(stderr, "invalid --count: %s\n", count_s);
+            return 2;
+        }
+        if (window_s != NULL && parse_u32(window_s, &window) != 0) {
+            fprintf(stderr, "invalid --window: %s\n", window_s);
+            return 2;
+        }
+        if (timeout_ms_s != NULL &&
+            parse_u32(timeout_ms_s, &timeout_ms) != 0) {
+            fprintf(stderr, "invalid --timeout-ms: %s\n", timeout_ms_s);
+            return 2;
+        }
+        if (min_rtt_ns_s != NULL &&
+            parse_u32(min_rtt_ns_s, &min_rtt_ns) != 0) {
+            fprintf(stderr, "invalid --min-rtt-ns: %s\n", min_rtt_ns_s);
+            return 2;
+        }
+        opts.bdf = opt_value(argc, argv, "--bdf");
+        opts.peer_if = opt_value(argc, argv, "--peer-if");
+        opts.src_mac = opt_value(argc, argv, "--src-mac");
+        opts.dst_mac = opt_value(argc, argv, "--dst-mac");
+        opts.ethertype = opt_value(argc, argv, "--ethertype");
+        opts.payload_hex = opt_value(argc, argv, "--payload-hex");
+        opts.packet_count = count;
+        opts.window = window;
+        opts.timeout_ms = timeout_ms;
+        opts.min_rtt_ns = min_rtt_ns;
+        opts.verbose = opt_present(argc, argv, "--verbose");
+        return raw_bench_run(&opts) == 0 ? 0 : 1;
     }
 
     usage(stderr, argv[0]);

@@ -144,6 +144,7 @@ make sync
 - `mlx5-rx-steer-test`
 - `mlx5-rx-wait-test`
 - `raw-loop`
+- `raw-bench`
 
 一方で、次のコマンドは low-level bring-up / debug 用です。
 
@@ -186,6 +187,8 @@ make sync
 ./mlxnicd mlx5-rx-wait-test <BDF>
 ./mlxnicd raw-loop --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> \
   [--payload-hex HEX] [--rx-count N] [--pre-rx-delay-ms N] [--timeout-ms N] [--verbose]
+./mlxnicd raw-bench --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> \
+  [--payload-hex HEX] [--count N] [--window N] [--timeout-ms N] [--min-rtt-ns N] [--verbose]
 ```
 
 ## 代表的な実行例
@@ -217,6 +220,30 @@ for i in range(20):
 print("sent",20,"frames on",iface)
 '"'"''
 ```
+
+### L2 loop benchmark
+
+`raw-bench` は `sdn-svr6 -> NIC -> wire -> sdn-svr5 forwarding -> wire -> NIC -> sdn-svr6`
+の往復を使って RTT と aggregate throughput を測るための sample command です。
+
+```sh
+ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-bench \
+  --bdf 0000:01:00.0 \
+  --peer-if eth2 \
+  --src-mac 02:00:00:00:00:06 \
+  --dst-mac ff:ff:ff:ff:ff:ff \
+  --ethertype 0x88b5 \
+  --count 1000 \
+  --window 8 \
+  --timeout-ms 30000 \
+  --min-rtt-ns 10000'
+```
+
+注意点:
+
+- この driver は RX promisc を使うので、環境によっては自分で送った frame の local copy が先に見える
+- `raw-bench` は payload に埋めた `seq` / `send_time_ns` で戻り frame を識別し、`--min-rtt-ns` 未満の非常に短い応答を local copy とみなして除外する
+- `--window` は同時に outstanding にする benchmark frame 数で、full-inline の 1 frame が SQ の 64-byte WQEBB を 2 個消費するため、現状は `8` 以下を前提にしている
 
 期待される結果の要点:
 
