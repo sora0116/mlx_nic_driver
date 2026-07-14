@@ -375,6 +375,7 @@ static void *sample_bench_parallel_worker(void *arg) {
     struct mlxnicd_pkt rx[128];
     uint32_t idle = 0;
 
+
     while (atomic_load_explicit(&ctx->replies, memory_order_relaxed) <
                ctx->opts->packet_count &&
            !atomic_load_explicit(&ctx->failed, memory_order_relaxed)) {

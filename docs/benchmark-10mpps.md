@@ -40,6 +40,7 @@ headroom rather than RTT distribution.
 | 14 | Eight queue/eight worker source | window 1024 | 7.806 Mpps | Correct and evenly distributed, but slower than four workers. |
 | 15 | Eight queue/eight worker source | window 2048 | failed at 69,889/67,841 | Unrecovered global-window packet loss; do not use this setting. |
 | 16 | Four workers, window 3072 | Eight-core peer | 8.308 Mpps | Ineffective; larger window increases queueing rather than throughput. |
+| 17 | Pin each source worker to CPU equal to its queue ID | Four workers, window 2048 | 8.110 Mpps | Ineffective (-6.4%); scheduler placement is better on this host. Reverted. |
 
 ## Confirmed bottlenecks
 
