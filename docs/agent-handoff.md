@@ -1249,3 +1249,55 @@ measurement table, peer experiments, and exact commands are maintained in
 `docs/benchmark-10mpps.md`.  The peer is currently a DPDK process because
 `sdn-svr5` still lacks IOMMU groups; retain this benchmark as a regression test
 until the self-driver peer path becomes deployable.
+
+## Poll-mode and line-rate investigation (2026-07-14)
+
+The next throughput milestone was explored with DPDK-style poll-mode behavior.
+The source driver previously waited synchronously for the TX CQE produced by
+each submitted burst.  `mlxnicd_tx_burst_q()` now first consumes at most one
+already-ready TX CQE and then rings the new burst without waiting for its
+completion.  RX CQ consumer-index notification is also deferred until the end
+of an RX burst.  This keeps the hardware, DMA, peer, and source workers in
+flight concurrently while retaining the existing bounded benchmark window.
+
+With four source workers/queues, a window of 2048, and the four-worker
+`peer/dpdk-macswap-peer`, this increased the one-million-pair result from
+10.6 Mpps to a reproducible 16.1 Mpps:
+
+```text
+16.056 Mpps / 8.478 Gbps   (first asynchronous TX run)
+16.214 Mpps / 8.561 Gbps   (128-packet TX burst)
+16.130 Mpps / 8.517 Gbps   (final reproduction)
+```
+
+Unsuccessful experiments are recorded in `docs/benchmark-10mpps.md`:
+
+- a 3072 global window failed with 768 outstanding packets per worker; do not
+  exceed 2048 before adding explicit SQ completion/reclaim tracking;
+- a 512-packet deep source burst did not improve on the 128-packet burst;
+- eight source workers/queues and an eight-core `testpmd` peer fell to
+  15.137 Mpps;
+- batching the RX CQ consumer DBR was correct but had no measurable benefit.
+
+The critical blocker to a real 100 GbE line-rate experiment is now physical,
+not the poll loop.  `sdn-svr5:0000:01:00.1` is operating at PCIe Gen1 x16:
+
+```text
+current_link_speed = 2.5 GT/s PCIe
+current_link_width = 16
+maximum            = 16.0 GT/s PCIe x16
+```
+
+`sudo dmesg` identifies its root port `0000:00:01.0` as a 32.000 Gb/s PCIe
+limit, though the same slot/NIC combination is capable of 252.048 Gb/s at
+Gen4 x16.  A DPDK peer cannot DMA at 100 GbE through this Gen1 link.  Before
+further line-rate measurements, set the `sdn-svr5` PCIe slot/root-port policy
+to Gen4/Auto in firmware, check NIC/riser seating, reboot, then verify:
+
+```sh
+cat /sys/bus/pci/devices/0000:01:00.1/current_link_speed
+cat /sys/bus/pci/devices/0000:01:00.1/current_link_width
+```
+
+Proceed only after these report `16.0 GT/s PCIe` and `16`; then rerun the
+current four-worker raw benchmark and continue from the 16.1 Mpps baseline.

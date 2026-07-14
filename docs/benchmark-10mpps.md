@@ -46,6 +46,12 @@ headroom rather than RTT distribution.
 | 20 | Restore 4 forwarding cores, 4 RX/TX queues, burst 128, 1,024 descriptors | Four-worker source, window 2048 | 8.291 Mpps (8.667 Mpps historical best) | Current best peer configuration. The difference from step 12 is normal run-to-run variation; both runs completed all one million pairs. |
 | 21 | Replace `testpmd` with repository `dpdk-macswap-peer`: dedicated RX burst → in-place MAC swap → TX burst loop | Four DPDK workers/queues, window 2048 | 8.315, 8.350 Mpps | Correct and reproducible, but not faster than the 8.667 Mpps `testpmd` peak. `testpmd` control-plane overhead is not the limiting factor. |
 | 22 | Give each source worker a private sequence range, reply counter, and one-quarter of the global outstanding window; remove per-packet shared `next_seq`/`replies` atomics | Four source workers/queues, dedicated DPDK peer, window 2048 | **10.617, 10.588 Mpps** | Effective (+27% over the 8.350 Mpps dedicated-peer baseline). Both runs completed 1,000,000/1,000,000 pairs; every worker completed exactly 250,000 sends and replies. **10 Mpps target achieved.** |
+| 23 | DPDK-style asynchronous TX: ring the SQ doorbell immediately; consume at most one ready TX CQE before the next burst rather than waiting for the current batch | Four workers/queues, dedicated peer, window 2048 | **16.056 Mpps** | Highly effective (+51% over step 22). Synchronous TX completion waiting was the main software limiter. |
+| 24 | Increase source TX burst from 32 to 128 packets | Four workers/queues, window 2048 | 16.214 Mpps | Marginal improvement (+1.0%). |
+| 25 | Increase window from 2048 to 3072 | Four workers/queues | failed at 356,163/353,091 | Unsafe: every worker stopped with exactly 768 unreturned packets. Do not exceed window 2048 before explicit SQ completion/reclaim tracking is implemented. |
+| 26 | Batch RX CQ consumer-index notification once per burst instead of once per CQE | Four workers/queues, window 2048 | 16.141 Mpps | Correct but no measurable improvement; received CQEs are usually not sufficiently accumulated. |
+| 27 | Deep source TX burst up to the per-worker window (512 packets) | Four workers/queues, window 2048 | 16.087 Mpps | Ineffective; larger bursts add queueing and do not improve the rate. |
+| 28 | Eight source workers/queues and eight-core `testpmd` peer | window 2048 | 15.137 Mpps | Ineffective; four queues/workers remain faster. |
 
 ## Confirmed bottlenecks
 
@@ -82,6 +88,51 @@ one-million-pair runs reached 10.617 and 10.588 Mpps, respectively.  Each
 worker reported exactly 250,000 transmitted packets and 250,000 replies.
 This is both a correctness check for the partitioning and evidence that cache
 line contention, rather than the DPDK peer, was the final blocker to 10 Mpps.
+
+### Line-rate investigation (in progress)
+
+The wire link is 100 GbE full duplex.  Minimum 64-byte Ethernet frames have a
+theoretical one-way line rate of approximately 148.8 Mpps.  The current
+request/reply metric counts one completed pair, so 16.214 Mpps corresponds to
+about 8.56 Gbps in the reported 60-byte-frame accounting and is far from the
+wire limit.
+
+The first DPDK-inspired change was the important one: `mlxnicd_tx_burst_q()`
+no longer blocks for the TX CQE created by the burst it has just doorbelled.
+Instead it polls one already-ready CQE before preparing the next burst.  This
+preserves a bounded benchmark SQ occupancy while allowing hardware DMA and
+wire transmission to overlap frame preparation, RX polling, and peer work.
+It raised the sustained million-pair rate from 10.6 to 16.1 Mpps.
+
+`perf record` on a ten-million-pair run still attributes substantial sampled
+time to `mlx5_poll_cq_once`, with `mlxnicd_tx_burst_q()` the next largest
+driver function.  CQ consumer-index updates were therefore batched for RX,
+but this had no measurable effect because the current reply path typically
+does not accumulate a large CQ burst before it is polled.  Increasing software
+burst size, window depth, or queue/core count also did not improve the rate;
+all measured outcomes are listed above.
+
+#### Physical blocker: `sdn-svr5` PCIe downtraining
+
+The DPDK peer host is not currently capable of a 100 GbE host-DMA rate.  Its
+NIC (`0000:01:00.1`) reports `current_link_speed=2.5 GT/s PCIe` and
+`current_link_width=16`, while its maximum is 16.0 GT/s x16.  Kernel boot logs
+identify root port `0000:00:01.0` as the limit and quantify only 32.000 Gb/s
+available PCIe bandwidth, versus 252.048 Gb/s for Gen4 x16.  This makes a
+100 GbE DPDK forwarding peer physically impossible regardless of poll-loop
+optimisation.
+
+Before interpreting further software experiments as a line-rate limit, set
+the `sdn-svr5` slot/root-port policy to PCIe Gen4/Auto in firmware (and check
+physical seating/riser quality), then reboot and verify:
+
+```sh
+cat /sys/bus/pci/devices/0000:01:00.1/current_link_speed
+cat /sys/bus/pci/devices/0000:01:00.1/current_link_width
+```
+
+The required result is `16.0 GT/s PCIe` and width `16`.  Only then can a
+100 GbE line-rate peer experiment be meaningful.
 
 ### Research-paper comparison and DPDK peer conclusion
 

@@ -2045,9 +2045,16 @@ mlx5_ctx_query_rq(struct mlx5_cmd_ctx *ctx, const struct mlx5_rq_res *rq,
     return rc;
 }
 
-static int mlx5_poll_cq_once(struct mlx5_cq_res *cq, const char *tag,
-                             uint32_t *byte_cnt_out,
-                             uint16_t *wqe_counter_out) {
+static void mlx5_cq_update_consumer(struct mlx5_cq_res *cq) {
+    put_be32((uint8_t *)cq->dbr_page.addr,
+             cq->cons_index & 0x00ffffffu);
+    __sync_synchronize();
+}
+
+static int mlx5_poll_cq_once_mode(struct mlx5_cq_res *cq, const char *tag,
+                                  uint32_t *byte_cnt_out,
+                                  uint16_t *wqe_counter_out,
+                                  int update_consumer) {
     uint8_t *cqe = (uint8_t *)cq->cq_page.addr +
                    ((cq->cons_index & (MLX5_CQ_CQE_COUNT - 1)) * MLX5_CQE_SIZE);
     uint8_t op_own = load_u8(cqe + 0x3f);
@@ -2078,8 +2085,9 @@ static int mlx5_poll_cq_once(struct mlx5_cq_res *cq, const char *tag,
         dump_hex("  cqe", cqe, MLX5_CQE_SIZE);
     }
     cq->cons_index++;
-    put_be32((uint8_t *)cq->dbr_page.addr, cq->cons_index & 0x00ffffffu);
-    __sync_synchronize();
+    if (update_consumer) {
+        mlx5_cq_update_consumer(cq);
+    }
     if (opcode == MLX5_CQE_REQ_ERR || opcode == MLX5_CQE_RESP_ERR) {
         fprintf(stderr, "%s got error CQE: syndrome=0x%02x vendor=0x%02x\n",
                 tag, load_u8(cqe + 0x36), load_u8(cqe + 0x37));
@@ -2092,6 +2100,12 @@ static int mlx5_poll_cq_once(struct mlx5_cq_res *cq, const char *tag,
         *wqe_counter_out = wqe_counter;
     }
     return 1;
+}
+
+static int mlx5_poll_cq_once(struct mlx5_cq_res *cq, const char *tag,
+                             uint32_t *byte_cnt_out,
+                             uint16_t *wqe_counter_out) {
+    return mlx5_poll_cq_once_mode(cq, tag, byte_cnt_out, wqe_counter_out, 1);
 }
 
 static int mlx5_poll_cq(struct mlx5_cq_res *cq, const char *tag,
@@ -2437,7 +2451,6 @@ static int mlx5_sq_prepare_send_raw(uint32_t tisn, uint32_t mkey,
 }
 
 static int mlx5_sq_ring_send(struct mlx5_cmd_ctx *ctx, uint32_t uar,
-                             struct mlx5_cq_res *cq,
                              struct mlx5_sq_res *sq, const uint8_t *last_wqe) {
     uint64_t uar_off = ((uint64_t)uar * MLX5_UAR_PAGE_SIZE) + MLX5_BF_OFFSET;
 
@@ -2460,7 +2473,7 @@ static int mlx5_sq_ring_send(struct mlx5_cmd_ctx *ctx, uint32_t uar,
         mmio_write64_native(ctx->dev.bar0, uar_off, word);
     }
     __sync_synchronize();
-    return mlx5_poll_cq(cq, "seq-post-send-batch", 1000, NULL, NULL);
+    return 0;
 }
 
 static int mlx5_ctx_set_hca_cap_raw(struct mlx5_cmd_ctx *ctx, uint16_t cap_type,
@@ -2953,6 +2966,18 @@ uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
     while (sent < nb_pkts) {
         uint16_t batch = nb_pkts - sent;
         uint8_t *last_wqe = NULL;
+        int poll_rc;
+
+        /* DPDK-style poll mode: consume at most one already-ready TX CQE,
+         * but never wait for the batch we are about to doorbell.  The raw
+         * benchmark bounds each queue to half an SQ of in-flight full-inline
+         * WQEs, so reusing the ring remains safe while completions catch up. */
+        poll_rc = mlx5_poll_cq_once(&dev->rt.tx_cq[queue_id],
+                                    "api-tx-poll", NULL, NULL);
+        if (poll_rc < 0) {
+            dev->last_error = MLXNICD_ERR_IO;
+            return sent;
+        }
 
         /* Each supported full-inline frame consumes two of 256 SQ WQEBBs. */
         if (batch > MLX5_SQ_WQE_COUNT / 2) {
@@ -2970,7 +2995,6 @@ uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
             }
         }
         if (mlx5_sq_ring_send(&dev->rt.ctx, dev->rt.uar,
-                              &dev->rt.tx_cq[queue_id],
                               &dev->rt.sq[queue_id], last_wqe) != 0) {
             dev->last_error = MLXNICD_ERR_IO;
             return sent;
@@ -3014,13 +3038,33 @@ uint16_t mlxnicd_rx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
 
     while (received < nb_pkts) {
         struct mlx5_rx_packet pkt = {0};
-        int rc = mlx5_rx_poll_one_api(dev, queue_id,
-                                      received == 0 ? timeout_ms : 0, &pkt);
+        int rc;
 
-        if (rc != 0) {
+        if (received == 0 && timeout_ms != 0) {
+            rc = mlx5_rx_poll_one_api(dev, queue_id, timeout_ms, &pkt);
+            if (rc == 0) {
+                pkts[received].data = pkt.data;
+                pkts[received].len = pkt.len;
+                received++;
+                continue;
+            }
+        } else {
+            memset(&pkt, 0, sizeof(pkt));
+            rc = mlx5_poll_cq_once_mode(&dev->rt.rx_cq[queue_id],
+                                        "api-rx-poll", &pkt.len,
+                                        &pkt.wqe_counter, 0);
+        }
+
+        if (rc <= 0) {
             if (received == 0) {
                 dev->last_error = MLXNICD_ERR_TIMEOUT;
             }
+            break;
+        }
+        pkt.slot = pkt.wqe_counter & (MLX5_RQ_WQE_COUNT - 1);
+        pkt.data = (uint8_t *)dev->rt.rq[queue_id].rx_pages[pkt.slot].addr;
+        if (pkt.data == NULL) {
+            dev->last_error = MLXNICD_ERR_IO;
             break;
         }
         pkts[received].data = pkt.data;
@@ -3028,6 +3072,7 @@ uint16_t mlxnicd_rx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
         received++;
     }
     if (received > 0) {
+        mlx5_cq_update_consumer(&dev->rt.rx_cq[queue_id]);
         dev->last_error = MLXNICD_OK;
         dev->rx_outstanding[queue_id] =
             (uint16_t)(dev->rx_outstanding[queue_id] + received);

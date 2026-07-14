@@ -372,9 +372,9 @@ static int sample_bench_is_reflection_fast(const struct sample_parallel_ctx *ctx
 static void *sample_bench_parallel_worker(void *arg) {
     struct sample_parallel_worker *worker = arg;
     struct sample_parallel_ctx *ctx = worker->ctx;
-    const uint32_t batch_cap = 32;
-    uint8_t frames[32][MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
-    struct mlxnicd_pkt tx[32];
+    const uint32_t batch_cap = 512;
+    uint8_t frames[512][MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+    struct mlxnicd_pkt tx[512];
     struct mlxnicd_pkt rx[128];
     uint32_t idle = 0;
 
