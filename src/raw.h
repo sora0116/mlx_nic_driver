@@ -33,6 +33,20 @@ struct raw_bench_opts {
     int verbose;
 };
 
+/* One-way raw TX throughput measurement.  The peer is an RX-only sink. */
+struct raw_flood_opts {
+    const char *bdf;
+    const char *peer_if;
+    const char *src_mac;
+    const char *dst_mac;
+    const char *ethertype;
+    const char *payload_hex;
+    uint32_t packet_count;
+    uint16_t queue_count;
+    int rss_udp;
+    int verbose;
+};
+
 /* Reflect raw-bench request frames using the same userspace driver. */
 struct raw_echo_opts {
     const char *bdf;
@@ -45,6 +59,7 @@ struct raw_echo_opts {
 
 int raw_loop_run(const struct raw_loop_opts *opts);
 int raw_bench_run(const struct raw_bench_opts *opts);
+int raw_flood_run(const struct raw_flood_opts *opts);
 int raw_echo_run(const struct raw_echo_opts *opts);
 
 #endif

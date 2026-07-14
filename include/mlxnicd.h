@@ -68,6 +68,8 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
 uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
                             const struct mlxnicd_pkt *pkts,
                             uint16_t nb_pkts);
+/* Wait until all submitted TX WQEs on one queue have completed. */
+int mlxnicd_tx_flush_q(struct mlxnicd_dev *dev, uint16_t queue_id);
 /*
  * Poll for up to nb_pkts packets. RX buffers stay owned by the driver.
  * Each packet returned here increments the number of packets that must later

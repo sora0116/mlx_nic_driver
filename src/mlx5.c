@@ -115,7 +115,8 @@ enum {
     MLX5_CREATE_CQ_IN_SIZE = 0x210,
     MLX5_CREATE_CQ_CQC_OFF = 0x10,
     MLX5_CREATE_CQ_PAS_OFF = 0x110,
-    MLX5_CREATE_SQ_IN_SIZE = 0x210,
+    /* 128 PAS entries for an 8,192-WQEBB (512 KiB) SQ. */
+    MLX5_CREATE_SQ_IN_SIZE = 0x510,
     MLX5_CREATE_SQ_SQC_OFF = 0x20,
     MLX5_SQC_WQ_OFF = 0x30,
     MLX5_CREATE_SQ_PAS_OFF = 0x110,
@@ -150,7 +151,7 @@ enum {
     MLX5_BF_OFFSET = 0x800,
     MLX5_CQ_CQE_COUNT = 2048,
     MLX5_CQE_SIZE = 64,
-    MLX5_SQ_WQE_COUNT = 2048,
+    MLX5_SQ_WQE_COUNT = 8192,
     MLX5_RQ_WQE_COUNT = 4096,
     MLX5_WQ_TYPE_CYCLIC = 1,
     MLX5_SEND_WQE_BB_LOG = 6,
@@ -213,6 +214,7 @@ struct mlx5_sq_res {
     struct mlx5_dma_page tx_page;
     uint32_t sqn;
     uint32_t prod_index;
+    uint32_t cons_index;
     int valid;
 };
 
@@ -1296,8 +1298,8 @@ static int mlx5_ctx_create_sq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
     uint8_t *sqc = in + MLX5_CREATE_SQ_SQC_OFF;
     uint8_t *wq = sqc + MLX5_SQC_WQ_OFF;
     const uint64_t sq_iova = 0x05000000ULL + (uint64_t)queue_id * 0x00100000ULL;
-    const uint64_t dbr_iova = sq_iova + 0x00040000ULL;
-    const uint64_t tx_iova = sq_iova + 0x00041000ULL;
+    const uint64_t dbr_iova = sq_iova + 0x00080000ULL;
+    const uint64_t tx_iova = sq_iova + 0x00081000ULL;
     int rc;
 
     memset(sq, 0, sizeof(*sq));
@@ -1330,7 +1332,7 @@ static int mlx5_ctx_create_sq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
     put_be32(wq + 0x0c, uar & 0x00ffffffu);
     put_be64(wq + 0x10, sq->dbr_page.iova);
     wq[0x21] = MLX5_SEND_WQE_BB_LOG; /* log_wq_stride=6 => 64B */
-    wq[0x23] = 11;                   /* log_wq_sz=11 => 2048 WQEBBs */
+    wq[0x23] = 13;                   /* log_wq_sz=13 => 8192 WQEBBs */
     mlx5_fill_pas(in, MLX5_CREATE_SQ_PAS_OFF, sq->sq_page.iova,
                   MLX5_SQ_PAGE_COUNT);
 
@@ -2476,6 +2478,43 @@ static int mlx5_sq_ring_send(struct mlx5_cmd_ctx *ctx, uint32_t uar,
     return 0;
 }
 
+static void mlx5_sq_reclaim_cqe(struct mlx5_sq_res *sq,
+                                uint16_t wqe_counter) {
+    uint32_t completed = (sq->cons_index & UINT32_C(0xffff0000)) |
+                         (uint32_t)wqe_counter;
+
+    /* The CQE reports the first WQEBB of the completed WQE.  Each full-inline
+     * benchmark WQE consumes two WQEBBs.  Reconstruct its 32-bit generation
+     * from the 16-bit hardware counter and advance past that WQE. */
+    if (completed < sq->cons_index) {
+        completed += UINT32_C(0x10000);
+    }
+    sq->cons_index = completed + 2;
+}
+
+static int mlx5_sq_poll_tx_cq(struct mlx5_cq_res *cq, struct mlx5_sq_res *sq,
+                               int wait) {
+    uint16_t wqe_counter = 0;
+    int rc;
+
+    if (wait) {
+        rc = mlx5_poll_cq(cq, "api-tx-reclaim", 1000, NULL, &wqe_counter);
+        if (rc != 0) {
+            return -1;
+        }
+    } else {
+        rc = mlx5_poll_cq_once(cq, "api-tx-poll", NULL, &wqe_counter);
+        if (rc == 0) {
+            return 0;
+        }
+        if (rc < 0) {
+            return -1;
+        }
+    }
+    mlx5_sq_reclaim_cqe(sq, wqe_counter);
+    return 1;
+}
+
 static int mlx5_ctx_set_hca_cap_raw(struct mlx5_cmd_ctx *ctx, uint16_t cap_type,
                                     const uint8_t *cap, size_t cap_len) {
     uint8_t in[0x10 + MLX5_HCA_CAP_SIZE] = {0};
@@ -2966,22 +3005,32 @@ uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
     while (sent < nb_pkts) {
         uint16_t batch = nb_pkts - sent;
         uint8_t *last_wqe = NULL;
-        int poll_rc;
+        uint32_t used_wqebbs;
+        uint32_t available_pkts;
 
-        /* DPDK-style poll mode: consume at most one already-ready TX CQE,
-         * but never wait for the batch we are about to doorbell.  The raw
-         * benchmark bounds each queue to half an SQ of in-flight full-inline
-         * WQEs, so reusing the ring remains safe while completions catch up. */
-        poll_rc = mlx5_poll_cq_once(&dev->rt.tx_cq[queue_id],
-                                    "api-tx-poll", NULL, NULL);
-        if (poll_rc < 0) {
+        /* A completion is requested only for the final WQE in each posted
+         * burst.  Do not touch the CQ while the SQ still has room: polling it
+         * for every burst was the dominant TX cost.  Once full, one completed
+         * burst's CQE advances cons_index past every older WQE as well. */
+        used_wqebbs = dev->rt.sq[queue_id].prod_index -
+                       dev->rt.sq[queue_id].cons_index;
+        if (used_wqebbs > MLX5_SQ_WQE_COUNT) {
             dev->last_error = MLXNICD_ERR_IO;
             return sent;
         }
+        available_pkts = (MLX5_SQ_WQE_COUNT - used_wqebbs) / 2;
+        if (available_pkts == 0) {
+            if (mlx5_sq_poll_tx_cq(&dev->rt.tx_cq[queue_id],
+                                    &dev->rt.sq[queue_id], 1) <= 0) {
+                dev->last_error = MLXNICD_ERR_IO;
+                return sent;
+            }
+            continue;
+        }
 
         /* Each supported full-inline frame consumes two of 256 SQ WQEBBs. */
-        if (batch > MLX5_SQ_WQE_COUNT / 2) {
-            batch = MLX5_SQ_WQE_COUNT / 2;
+        if (batch > available_pkts) {
+            batch = (uint16_t)available_pkts;
         }
         for (uint16_t i = 0; i < batch; i++) {
             int rc = mlx5_sq_prepare_send_raw(dev->rt.tisn, dev->rt.mkey,
@@ -3010,6 +3059,28 @@ uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
 uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
                           const struct mlxnicd_pkt *pkts, uint16_t nb_pkts) {
     return mlxnicd_tx_burst_q(dev, 0, pkts, nb_pkts);
+}
+
+int mlxnicd_tx_flush_q(struct mlxnicd_dev *dev, uint16_t queue_id) {
+    struct mlx5_sq_res *sq;
+
+    if (dev == NULL || !dev->started ||
+        (dev->config.flags & MLXNICD_DEV_F_TX) == 0) {
+        return -1;
+    }
+    if (queue_id >= dev->rt.queue_count) {
+        dev->last_error = MLXNICD_ERR_INVAL;
+        return -1;
+    }
+    sq = &dev->rt.sq[queue_id];
+    while (sq->cons_index != sq->prod_index) {
+        if (mlx5_sq_poll_tx_cq(&dev->rt.tx_cq[queue_id], sq, 1) <= 0) {
+            dev->last_error = MLXNICD_ERR_IO;
+            return -1;
+        }
+    }
+    dev->last_error = MLXNICD_OK;
+    return 0;
 }
 
 static int mlx5_rx_poll_one_api(struct mlxnicd_dev *dev, uint16_t queue_id,

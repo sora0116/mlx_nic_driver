@@ -145,6 +145,7 @@ make sync
 - `mlx5-rx-wait-test`
 - `raw-loop`
 - `raw-bench`
+- `raw-flood`
 
 一方で、次のコマンドは low-level bring-up / debug 用です。
 
@@ -189,6 +190,8 @@ make sync
   [--payload-hex HEX] [--rx-count N] [--pre-rx-delay-ms N] [--timeout-ms N] [--verbose]
 ./mlxnicd raw-bench --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> \
   [--payload-hex HEX] [--count N] [--window N] [--timeout-ms N] [--min-rtt-ns N] [--verbose]
+./mlxnicd raw-flood --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> \
+  [--payload-hex HEX] [--count N] [--queues N] [--rss-udp] [--verbose]
 ```
 
 ## 代表的な実行例
@@ -251,6 +254,35 @@ ssh sdn-svr5 "setsid -f sh -c 'tail -f /dev/null | sudo dpdk-testpmd \
   -l 1,2 -n 4 -a 0000:01:00.1 -- \
   --nb-cores=1 --forward-mode=macswap --port-topology=loop --auto-start' \
   >/tmp/testpmd-mlxnicd.log 2>&1"
+```
+
+### One-way PCIe throughput benchmark
+
+`raw-flood` は source 側の reply RX や RTT 計測を含めず、TX-only mlxnicd
+driver から DPDK RX-only sink へ一方向送信するための command です。`--rss-udp`
+は UDP source port を packet ごとに変えて RSS queue に分散します。
+
+`sdn-svr5` が現在 PCIe Gen1 x16 のため、物理リンクの 32 Gb/s は Ethernet
+payload 32 Gb/s を意味しません。短い PCIe DMA write の framing を含む実効値は
+この環境では約 20 Gb/s です。次の 100M packet 実行で 98-byte frame の
+**25.827 Mpps / 20.248 Gb/s**、peer `RX-missed=0` を確認しています。
+
+```sh
+# sdn-svr5: RSS RX-only sink. CPU 0 is the main lcore; CPUs 1--8 are workers.
+ssh sdn-svr5 "setsid -f sh -c 'sudo dpdk-testpmd \
+  -l 0,1,2,3,4,5,6,7,8 -n 4 -a 0000:01:00.1 -- \
+  --nb-cores=8 --rxq=8 --txq=8 --rss-ip --rss-udp \
+  --forward-mode=rxonly --burst=128 --rxd=8192 --txd=2048 \
+  --stats-period=1 --auto-start' \
+  >/tmp/testpmd-mlxnicd.log 2>&1"
+
+# sdn-svr6: 98-byte frame (66-byte base plus 32-byte payload)
+ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-flood \
+  --bdf 0000:01:00.0 --peer-if eth2 \
+  --src-mac 02:00:00:00:00:06 --dst-mac ff:ff:ff:ff:ff:ff \
+  --ethertype 0x0800 \
+  --payload-hex aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --rss-udp --queues 8 --count 100000000'
 ```
 
 停止時は `ssh sdn-svr5 'sudo pkill -f dpdk-testpmd'` を実行します。

@@ -22,6 +22,7 @@ enum {
     MLXNICD_SAMPLE_BENCH_MAX_WINDOW = 4096,
     MLXNICD_SAMPLE_BENCH_RX_BURST = 128,
     MLXNICD_SAMPLE_BENCH_RX_POST_COUNT = 4096,
+    MLXNICD_SAMPLE_FLOOD_BURST = 4096,
     MLXNICD_SAMPLE_BENCH_F_REPLY = 0x0001,
 };
 
@@ -65,6 +66,23 @@ struct sample_parallel_worker {
     uint32_t window;
     uint32_t replies;
     uint64_t rx_frames;
+};
+
+struct sample_flood_ctx {
+    struct mlxnicd_dev *dev;
+    const struct raw_bench_opts *frame_opts;
+    const uint8_t *template_frame;
+    uint32_t frame_len;
+    atomic_int go;
+    atomic_int failed;
+};
+
+struct sample_flood_worker {
+    struct sample_flood_ctx *ctx;
+    uint16_t queue_id;
+    uint32_t seq_begin;
+    uint32_t seq_next;
+    uint32_t seq_end;
 };
 
 static void sample_report_dev_error(const char *what, struct mlxnicd_dev *dev) {
@@ -373,8 +391,9 @@ static void *sample_bench_parallel_worker(void *arg) {
     struct sample_parallel_worker *worker = arg;
     struct sample_parallel_ctx *ctx = worker->ctx;
     const uint32_t batch_cap = 512;
-    uint8_t frames[512][MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
-    struct mlxnicd_pkt tx[512];
+    uint8_t frames[MLXNICD_SAMPLE_FLOOD_BURST]
+                  [MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+    struct mlxnicd_pkt tx[MLXNICD_SAMPLE_FLOOD_BURST];
     struct mlxnicd_pkt rx[128];
     uint32_t idle = 0;
 
@@ -481,6 +500,143 @@ static int sample_raw_bench_parallel(struct mlxnicd_dev *dev,
                 workers[q].replies, workers[q].rx_frames);
     rc = !atomic_load(&ctx.failed) && *sent_out == opts->packet_count &&
          *received_out == opts->packet_count ? 0 : -1;
+    return rc;
+}
+
+static void *sample_raw_flood_worker(void *arg) {
+    struct sample_flood_worker *worker = arg;
+    struct sample_flood_ctx *ctx = worker->ctx;
+    uint8_t (*frames)[MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+    struct mlxnicd_pkt *tx;
+
+    /* Keep the large batching buffers off pthread's comparatively small
+     * default stack.  The allocation is per queue and remains private to its
+     * sole worker. */
+    frames = malloc((size_t)MLXNICD_SAMPLE_FLOOD_BURST * sizeof(*frames));
+    tx = malloc((size_t)MLXNICD_SAMPLE_FLOOD_BURST * sizeof(*tx));
+    if (frames == NULL || tx == NULL) {
+        free(tx);
+        free(frames);
+        atomic_store_explicit(&ctx->failed, 1, memory_order_relaxed);
+        return NULL;
+    }
+
+    while (!atomic_load_explicit(&ctx->go, memory_order_acquire)) {
+    }
+    while (worker->seq_next < worker->seq_end &&
+           !atomic_load_explicit(&ctx->failed, memory_order_relaxed)) {
+        uint32_t batch = worker->seq_end - worker->seq_next;
+
+        if (batch > MLXNICD_SAMPLE_FLOOD_BURST) {
+            batch = MLXNICD_SAMPLE_FLOOD_BURST;
+        }
+        for (uint32_t i = 0; i < batch; i++) {
+            sample_bench_build_from_template(
+                ctx->frame_opts, ctx->template_frame, ctx->frame_len,
+                worker->seq_next + i, 0, 0, frames[i]);
+            tx[i].data = frames[i];
+            tx[i].len = ctx->frame_len;
+        }
+        if (mlxnicd_tx_burst_q(ctx->dev, worker->queue_id, tx,
+                               (uint16_t)batch) != batch) {
+            atomic_store_explicit(&ctx->failed, 1, memory_order_relaxed);
+            break;
+        }
+        worker->seq_next += batch;
+    }
+    if (!atomic_load_explicit(&ctx->failed, memory_order_relaxed) &&
+        mlxnicd_tx_flush_q(ctx->dev, worker->queue_id) != 0) {
+        atomic_store_explicit(&ctx->failed, 1, memory_order_relaxed);
+    }
+    free(tx);
+    free(frames);
+    return NULL;
+}
+
+int sample_raw_flood(const struct raw_flood_opts *opts) {
+    struct raw_bench_opts frame_opts = {0};
+    struct mlxnicd_dev *dev = NULL;
+    struct mlxnicd_dev_config config;
+    struct sample_flood_ctx ctx = {0};
+    struct sample_flood_worker workers[8] = {{0}};
+    pthread_t threads[8];
+    uint8_t frame_template[MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+    uint32_t frame_len = 0;
+    uint64_t start_ns;
+    uint64_t end_ns;
+    uint64_t sent = 0;
+    int rc = -1;
+
+    if (opts == NULL) return -1;
+    frame_opts.bdf = opts->bdf;
+    frame_opts.peer_if = opts->peer_if;
+    frame_opts.src_mac = opts->src_mac;
+    frame_opts.dst_mac = opts->dst_mac;
+    frame_opts.ethertype = opts->ethertype;
+    frame_opts.payload_hex = opts->payload_hex;
+    frame_opts.rss_udp = opts->rss_udp;
+    if (sample_bench_build_frame(&frame_opts, 0, 0, 0, frame_template,
+                                 sizeof(frame_template), &frame_len) != 0) {
+        return -1;
+    }
+
+    mlxnicd_dev_config_init(&config);
+    config.flags = MLXNICD_DEV_F_TX;
+    config.queue_count = opts->queue_count;
+    config.log_verbose = opts->verbose;
+    fprintf(stdout,
+            "raw-flood: peer-if=%s bdf=%s count=%" PRIu32
+            " queues=%u frame_len=%u\n",
+            opts->peer_if, opts->bdf, opts->packet_count, opts->queue_count,
+            frame_len);
+    if (mlxnicd_dev_open(&dev, opts->bdf) != 0) goto out;
+    if (mlxnicd_dev_configure(dev, &config) != 0 ||
+        mlxnicd_dev_start(dev) != 0) {
+        sample_report_dev_error("raw-flood device start", dev);
+        goto out;
+    }
+
+    ctx.dev = dev;
+    ctx.frame_opts = &frame_opts;
+    ctx.template_frame = frame_template;
+    ctx.frame_len = frame_len;
+    for (uint16_t q = 0; q < opts->queue_count; q++) {
+        workers[q].ctx = &ctx;
+        workers[q].queue_id = q;
+        workers[q].seq_begin =
+            (uint32_t)(((uint64_t)opts->packet_count * q) / opts->queue_count);
+        workers[q].seq_next = workers[q].seq_begin;
+        workers[q].seq_end = (uint32_t)(((uint64_t)opts->packet_count * (q + 1)) /
+                                        opts->queue_count);
+        if (pthread_create(&threads[q], NULL, sample_raw_flood_worker,
+                           &workers[q]) != 0) {
+            atomic_store(&ctx.failed, 1);
+            atomic_store(&ctx.go, 1);
+            for (uint16_t i = 0; i < q; i++) pthread_join(threads[i], NULL);
+            goto out;
+        }
+    }
+    start_ns = sample_now_ns();
+    atomic_store_explicit(&ctx.go, 1, memory_order_release);
+    for (uint16_t q = 0; q < opts->queue_count; q++) {
+        pthread_join(threads[q], NULL);
+        sent += workers[q].seq_next - workers[q].seq_begin;
+    }
+    end_ns = sample_now_ns();
+    if (!atomic_load(&ctx.failed) && sent == opts->packet_count) {
+        uint64_t elapsed = end_ns - start_ns;
+
+        fprintf(stdout, "raw-flood: ok tx=%" PRIu64 "\n", sent);
+        fprintf(stdout, "raw-flood: tx rate %.3f Mpps %.3f Gbps\n",
+                sample_rate_pps(sent, elapsed) / 1e6,
+                sample_rate_gbps(sent * frame_len, elapsed));
+        rc = 0;
+    } else {
+        fprintf(stdout, "raw-flood: failed tx=%" PRIu64 "\n", sent);
+    }
+
+out:
+    mlxnicd_dev_close(dev);
     return rc;
 }
 

@@ -257,6 +257,70 @@ ssh sdn-svr5 "setsid -f sh -c 'sudo ~/work/takagi/nicd/peer/dpdk-macswap-peer \\
 four queues, burst 128, and 1,024 RX/TX descriptors.  It requires exactly one
 allowed NIC and one main lcore plus one worker lcore per queue.
 
+## PCIe Gen1 x16 effective-limit milestone (2026-07-14)
+
+The host-DMA target was changed from 100 GbE wire rate to the maximum rate of
+the currently downtrained `sdn-svr5` PCIe link.  `raw-bench` is not suitable
+for this measurement: it counts a request/reply pair and spends source-side
+work receiving its own reflected traffic and replies.  The new `raw-flood`
+command is a one-way TX measurement:
+
+```text
+mlxnicd raw-flood / sdn-svr6 / 0000:01:00.0
+  -> 100 GbE wire -> DPDK testpmd RX-only sink / sdn-svr5 / 0000:01:00.1
+```
+
+It creates TX-only mlxnicd queues, gives each worker a disjoint packet sequence
+range, varies the IPv4/UDP source port with `--rss-udp`, and calls
+`mlxnicd_tx_flush_q()` before reporting completion.  A TX CQE is requested only
+for the final WQE of a posted burst.  The SQ consumer index is reconstructed
+from that CQE's WQE counter, so it safely reclaims every preceding WQE in the
+burst.  This supports one-way traffic without source RX/reply work.
+
+The TX SQ was expanded to 8,192 64-byte WQEBBs (512 KiB, 128 PAS entries).
+Each supported full-inline frame uses two WQEBBs.  `mlxnicd_tx_burst_q()` now
+waits for a TX CQE only when there is no room for another WQE; it does not wait
+for a just-doorbelled burst.  `raw-flood` batches up to 4,096 frames per queue
+and keeps those worker-private buffers on the heap rather than a pthread stack.
+
+Measured source results, eight source queues and an eight-worker DPDK RX-only
+sink:
+
+| Frame length | Source rate | Peer result | Interpretation |
+| --- | ---: | --- | --- |
+| 66 B | 32.998 Mpps / 17.423 Gb/s | 50,000,000 received, `RX-missed=0` | Small-frame, lossless baseline. |
+| 98 B | 25.747 Mpps / 20.186 Gb/s | 50,000,000 received, `RX-missed=0` | First lossless maximum-frame run after peer tuning. |
+| 98 B | **25.827 Mpps / 20.248 Gb/s** | **100,000,000 received, `RX-missed=0`** | Reproduced effective-limit result. |
+
+The `32.000 Gb/s` reported by the kernel for Gen1 x16 is a physical PCIe link
+rate, not application payload bandwidth.  Gen1's 8b/10b encoding and the PCIe
+TLP/DLLP framing for many short NIC DMA writes reduce usable Ethernet payload
+bandwidth substantially.  The 20.248 Gb/s 98-byte lossless run is therefore
+the verified effective PCIe limit for the present hardware, frame format, and
+driver's maximum 98-byte inline WQE.  It is not a claim that the 100 GbE wire
+is saturated.
+
+The peer settings are part of the result.  An earlier RX-only command used
+`-l 1,2,3,4,5,6,7,8,9` and `--rxd=2048`; its main lcore and a worker shared a
+physical core and the 98-byte run lost 12,971 of 50,000,000 frames.  Use CPU 0
+as main lcore, CPUs 1--8 as workers, and 8,192 RX descriptors instead:
+
+```sh
+ssh sdn-svr5 "setsid -f sh -c 'sudo dpdk-testpmd \
+  -l 0,1,2,3,4,5,6,7,8 -n 4 -a 0000:01:00.1 -- \
+  --nb-cores=8 --rxq=8 --txq=8 --rss-ip --rss-udp \
+  --forward-mode=rxonly --burst=128 --rxd=8192 --txd=2048 \
+  --stats-period=1 --auto-start' \
+  >/tmp/testpmd-mlxnicd.log 2>&1"
+
+ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-flood \
+  --bdf 0000:01:00.0 --peer-if eth2 \
+  --src-mac 02:00:00:00:00:06 --dst-mac ff:ff:ff:ff:ff:ff \
+  --ethertype 0x0800 \
+  --payload-hex aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --rss-udp --queues 8 --count 100000000'
+```
+
 ## Next work
 
 The 10 Mpps target is met.  Follow-on work should retain this benchmark as a

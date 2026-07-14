@@ -1301,3 +1301,39 @@ cat /sys/bus/pci/devices/0000:01:00.1/current_link_width
 
 Proceed only after these report `16.0 GT/s PCIe` and `16`; then rerun the
 current four-worker raw benchmark and continue from the 16.1 Mpps baseline.
+
+## PCIe effective-limit result (2026-07-14)
+
+The current performance target is the peer's actual PCIe Gen1 x16 limit, not
+100 GbE wire rate.  The one-way `raw-flood` tool was added specifically for
+this: `sdn-svr6` uses TX-only mlxnicd queues and `sdn-svr5` runs DPDK
+`testpmd` as an RX-only sink.  It excludes request/reply and source RX work.
+
+The driver now tracks a 32-bit SQ consumer index from TX CQE WQE counters,
+permits 8,192 SQ WQEBBs per queue, and exports `mlxnicd_tx_flush_q()` to wait
+for all one-way submitted packets before teardown.  `raw-flood` supports
+`--payload-hex`, `--queues`, and `--rss-udp`; use the latter to spread packets
+across DPDK RSS queues.
+
+Verified lossless result (100M packets): **98-byte frames, 25.827 Mpps,
+20.248 Gb/s**, with DPDK reporting `RX-packets=100000000`, `RX-missed=0`, and
+`RX-nombuf=0`.  This is the effective payload ceiling for the present Gen1 x16
+link and short inline DMA writes.  The physical link's 32 Gb/s figure includes
+8b/10b and PCIe protocol overhead, so it must not be compared directly to the
+Ethernet payload Gbps printed by `raw-flood`.
+
+Required peer command:
+
+```sh
+ssh sdn-svr5 "setsid -f sh -c 'sudo dpdk-testpmd \
+  -l 0,1,2,3,4,5,6,7,8 -n 4 -a 0000:01:00.1 -- \
+  --nb-cores=8 --rxq=8 --txq=8 --rss-ip --rss-udp \
+  --forward-mode=rxonly --burst=128 --rxd=8192 --txd=2048 \
+  --stats-period=1 --auto-start' \
+  >/tmp/testpmd-mlxnicd.log 2>&1"
+```
+
+The main lcore must be CPU 0 and workers CPU 1--8.  Do not use the older
+`-l 1,2,3,4,5,6,7,8,9` mapping: it places the main lcore and one worker on
+hyperthreads of the same physical core.  With that mapping and only 2,048 RX
+descriptors, a 98-byte 50M run lost 12,971 frames.

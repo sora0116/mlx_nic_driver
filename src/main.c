@@ -31,6 +31,7 @@ static void usage(FILE *out, const char *argv0) {
             "  %s mlx5-query-hca-cap <BDF>\n"
             "  %s raw-loop --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--rx-count N] [--pre-rx-delay-ms N] [--timeout-ms N] [--verbose]\n"
             "  %s raw-bench --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--count N] [--window N] [--timeout-ms N] [--min-rtt-ns N] [--verbose]\n"
+            "  %s raw-flood --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--count N] [--queues N] [--rss-udp] [--verbose]\n"
             "  %s raw-echo --bdf <BDF> --peer-if <ifname> --ethertype <hex> [--count N] [--timeout-ms N] [--verbose]\n"
             "\n"
             "examples:\n"
@@ -39,7 +40,7 @@ static void usage(FILE *out, const char *argv0) {
             "  %s bar-read 0000:01:00.0 0 0x0 32\n",
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-            argv0, argv0, argv0,
+            argv0, argv0, argv0, argv0,
             argv0, argv0, argv0, argv0);
 }
 
@@ -347,6 +348,35 @@ int main(int argc, char **argv) {
         opts.throughput_only = opt_present(argc, argv, "--throughput-only");
         opts.verbose = opt_present(argc, argv, "--verbose");
         return raw_bench_run(&opts) == 0 ? 0 : 1;
+    }
+
+    if (strcmp(argv[1], "raw-flood") == 0) {
+        struct raw_flood_opts opts;
+        uint32_t count = 1000000;
+        uint32_t queues = 1;
+        const char *count_s = opt_value(argc, argv, "--count");
+        const char *queues_s = opt_value(argc, argv, "--queues");
+
+        if (count_s != NULL && parse_u32(count_s, &count) != 0) {
+            fprintf(stderr, "invalid --count: %s\n", count_s);
+            return 2;
+        }
+        if (queues_s != NULL && parse_u32(queues_s, &queues) != 0) {
+            fprintf(stderr, "invalid --queues: %s\n", queues_s);
+            return 2;
+        }
+        memset(&opts, 0, sizeof(opts));
+        opts.bdf = opt_value(argc, argv, "--bdf");
+        opts.peer_if = opt_value(argc, argv, "--peer-if");
+        opts.src_mac = opt_value(argc, argv, "--src-mac");
+        opts.dst_mac = opt_value(argc, argv, "--dst-mac");
+        opts.ethertype = opt_value(argc, argv, "--ethertype");
+        opts.payload_hex = opt_value(argc, argv, "--payload-hex");
+        opts.packet_count = count;
+        opts.queue_count = (uint16_t)queues;
+        opts.rss_udp = opt_present(argc, argv, "--rss-udp");
+        opts.verbose = opt_present(argc, argv, "--verbose");
+        return raw_flood_run(&opts) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "raw-echo") == 0) {
