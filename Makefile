@@ -17,11 +17,14 @@ EXAMPLE_OBJ := $(EXAMPLE_SRC:.c=.o)
 REMOTE_HOST ?= sdn-svr6
 REMOTE_DIR ?= ~/work/takagi/nicd
 
-.PHONY: all clean sync remote-run remote-probe remote-vfio-check remote-vfio-probe remote-raw-loop-preflight examples
+.PHONY: all clean sync remote-run remote-probe remote-vfio-check remote-vfio-probe remote-raw-loop-preflight examples dpdk-peer
 
 all: $(TARGET)
 
 examples: $(EXAMPLE_API)
+
+dpdk-peer:
+	$(MAKE) -C peer
 
 $(TARGET): $(APP_OBJ) $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $(APP_OBJ) -L. -lmlxnicd

@@ -41,6 +41,10 @@ headroom rather than RTT distribution.
 | 15 | Eight queue/eight worker source | window 2048 | failed at 69,889/67,841 | Unrecovered global-window packet loss; do not use this setting. |
 | 16 | Four workers, window 3072 | Eight-core peer | 8.308 Mpps | Ineffective; larger window increases queueing rather than throughput. |
 | 17 | Pin each source worker to CPU equal to its queue ID | Four workers, window 2048 | 8.110 Mpps | Ineffective (-6.4%); scheduler placement is better on this host. Reverted. |
+| 18 | Paper-inspired peer: one DPDK forwarding core polls four RX/TX queues, burst 256, 2,048 descriptors | Four-worker source, window 2048 | 8.197 Mpps | Ineffective. This host does not reproduce the paper's single-core multi-queue gain in a MAC-swap request/reply path. |
+| 19 | Align peer burst with the source's 32-packet TX batch (`--burst=32`, 2,048 descriptors) | Four-worker source, window 2048 | 8.125 Mpps | Ineffective; smaller peer batches reduce throughput. |
+| 20 | Restore 4 forwarding cores, 4 RX/TX queues, burst 128, 1,024 descriptors | Four-worker source, window 2048 | 8.291 Mpps (8.667 Mpps historical best) | Current best peer configuration. The difference from step 12 is normal run-to-run variation; both runs completed all one million pairs. |
+| 21 | Replace `testpmd` with repository `dpdk-macswap-peer`: dedicated RX burst → in-place MAC swap → TX burst loop | Four DPDK workers/queues, window 2048 | 8.315, 8.350 Mpps | Correct and reproducible, but not faster than the 8.667 Mpps `testpmd` peak. `testpmd` control-plane overhead is not the limiting factor. |
 
 ## Confirmed bottlenecks
 
@@ -59,6 +63,48 @@ cycles/pair, 3.47 IPC). A single Atom core cannot sustain 10 Mpps at this cost.
 The next architectural step is multiple SQ/RQ/CQ pairs and worker ownership;
 the benchmark packet's `--rss-udp` mode provides distinct UDP flows needed for
 hardware RSS distribution.
+
+### Research-paper comparison and DPDK peer conclusion
+
+`references/main.pdf` reports 38 to 94 Mpps per flow on a ConnectX-7 (200 GbE,
+PCIe Gen5 x16) system.  Its key observation is not a generic `testpmd` flag:
+when a *single* core polls four or more hardware RX queues, independent DMA
+transactions can progress in parallel and each visit can consume a full
+256-packet batch.  To make one flow eligible for that distribution, the paper
+changes a per-packet 5-tuple field and uses RSS/Flow Director to steer packet
+batches round-robin across the queues.
+
+The benchmark already implements the corresponding steering prerequisite:
+`--rss-udp` makes each packet an IPv4/UDP packet and varies its UDP source
+port, while the peer enables `--rss-ip --rss-udp` on four RX queues.  The
+driver's indirect TIR hashes IPv4/UDP 4-tuples and its RQT uses all four RQs,
+so the source-side verification has shown an even 25% distribution.
+
+The remaining paper-inspired peer experiment was therefore to replace the
+four forwarding cores with one forwarding core that polls all four queues.
+It reached 8.197 Mpps, below the four-core peer's observed 8.291--8.667 Mpps.
+Reducing `testpmd`'s burst from 128 to the source's 32-packet transmit batch
+also fell to 8.125 Mpps.  These measurements keep the same source, traffic,
+window, and 4-queue RSS setup, so they isolate the peer configuration.
+
+The paper's absolute result should not be used as a direct target for this
+machine: its evaluation hardware is substantially newer and it reports
+receive-only and one-way forwarding scenarios as well as loopback.  Here a
+completed benchmark packet needs both a custom-driver transmit/receive path
+on `sdn-svr6` and a DPDK MAC-swap receive/transmit path on `sdn-svr5`.
+Accordingly, the active peer uses four forwarding cores rather than the
+paper's single-core receive-only configuration.  Further peer-only `testpmd`
+tuning is not currently justified; the next throughput gain should remove
+contention in the source's multi-worker benchmark datapath (notably the
+global atomic sequence and reply counters).
+
+To verify that conclusion independently of `testpmd`, this branch provides
+`peer/dpdk-macswap-peer`.  It creates four RSS RX/TX queue pairs and gives one
+DPDK worker to each pair.  Its entire hot loop is `rte_eth_rx_burst`, an
+in-place Ethernet source/destination MAC exchange, then `rte_eth_tx_burst`;
+unsent mbufs are freed.  Two one-million-pair runs reached 8.315 and 8.350
+Mpps.  Thus the purpose-built peer works, but does not exceed the generic
+peer's 8.667 Mpps peak.
 
 ## Multi-queue bring-up notes
 
@@ -101,13 +147,13 @@ table and lose much of the intended cache locality.
 
 `sdn-svr5` presently cannot bind its NIC to VFIO because no IOMMU groups are
 exported, even though the kernel command line includes `intel_iommu=on
-iommu=pt`. DPDK is a temporary peer only. Its one-core configuration reaches
-the current source rate; the four-core RSS `testpmd` experiment did not improve
-it and is recorded above rather than treated as a solution.
+iommu=pt`. DPDK is a temporary peer only. The paper-inspired one-core,
+four-queue configuration and the smaller peer-burst configuration are recorded
+above; neither improved this machine's bidirectional benchmark.
 
 ## Current commands
 
-Start the four-core RSS peer:
+Start the current best four-core RSS peer:
 
 ```sh
 ssh sdn-svr5 "setsid -f sh -c 'tail -f /dev/null | sudo dpdk-testpmd \
@@ -125,14 +171,28 @@ ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-bench \
   --bdf 0000:01:00.0 --peer-if eth2 \
   --src-mac 02:00:00:00:00:06 --dst-mac ff:ff:ff:ff:ff:ff \
   --ethertype 0x0800 --rss-udp --throughput-only \
-  --count 1000000 --window 1024 --timeout-ms 30000'
+  --queues 4 --count 1000000 --window 2048 --timeout-ms 30000'
 ```
+
+Build and start the dedicated peer alternative (on `sdn-svr5`):
+
+```sh
+ssh sdn-svr5 'cd ~/work/takagi/nicd && make dpdk-peer'
+ssh sdn-svr5 "setsid -f sh -c 'sudo ~/work/takagi/nicd/peer/dpdk-macswap-peer \\
+  -l 1,2,3,4,5 -n 4 -a 0000:01:00.1' \\
+  >/tmp/dpdk-macswap-peer.log 2>&1"
+```
+
+`dpdk-macswap-peer` intentionally defaults to the comparison configuration:
+four queues, burst 128, and 1,024 RX/TX descriptors.  It requires exactly one
+allowed NIC and one main lcore plus one worker lcore per queue.
 
 ## Next work
 
-1. Generalise the driver runtime from one SQ/RQ/CQ to multiple queue pairs.
-2. Expose queue-specific burst APIs and give each queue to one polling worker.
-3. Populate the RQT with multiple RQ numbers and verify hardware RSS across
-   the UDP flows.
-4. Compare 1, 2, and 4 worker throughput against the same peer and record all
-   results here.
+1. Remove global atomic contention from the four source workers by assigning
+   each worker a private sequence range and a private completion counter.
+2. Measure the resulting 1, 2, and 4 worker rates against the unchanged peer.
+3. Compare the repository's `peer/dpdk-macswap-peer` (a dedicated DPDK
+   MAC-swap loop) with `testpmd` fairly before attributing any remaining limit
+   to the peer.
+4. Record every result here, including regressions.
