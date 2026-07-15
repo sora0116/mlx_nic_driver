@@ -29,6 +29,7 @@ static void usage(FILE *out, const char *argv0) {
             "  %s mlx5-rx-steer-test <BDF>\n"
             "  %s mlx5-rx-wait-test <BDF>\n"
             "  %s mlx5-query-hca-cap <BDF>\n"
+            "  %s mlx5-query-eth-cap <BDF>\n"
             "  %s raw-loop --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--rx-count N] [--pre-rx-delay-ms N] [--timeout-ms N] [--verbose]\n"
             "  %s raw-bench --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--count N] [--window N] [--timeout-ms N] [--min-rtt-ns N] [--verbose]\n"
             "  %s raw-flood --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--frame-len N] [--count N] [--queues N] [--rss-udp] [--mpwqe] [--verbose]\n"
@@ -40,7 +41,7 @@ static void usage(FILE *out, const char *argv0) {
             "  %s bar-read 0000:01:00.0 0 0x0 32\n",
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-            argv0, argv0, argv0, argv0,
+            argv0, argv0, argv0, argv0, argv0,
             argv0, argv0, argv0, argv0);
 }
 
@@ -228,6 +229,14 @@ int main(int argc, char **argv) {
             return 2;
         }
         return mlx5_query_hca_cap(argv[2]) == 0 ? 0 : 1;
+    }
+
+    if (strcmp(argv[1], "mlx5-query-eth-cap") == 0) {
+        if (argc != 3) {
+            usage(stderr, argv[0]);
+            return 2;
+        }
+        return mlx5_query_eth_cap(argv[2]) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "mlx5-rx-objects") == 0) {

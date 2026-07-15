@@ -1510,10 +1510,10 @@ all effective/ineffective attempts are in
 Current best:
 
 ```text
-raw-flood --ethertype 0x0800 --rss-udp --frame-len 64 --queues 8 --count 50000000
-source: 45.933 Mpps / 23.518 Gb/s
-peer:   rx_packets_phy +50,000,000
-        rx_bytes_phy   +3,400,000,000
+raw-flood --ethertype 0x0800 --rss-udp --frame-len 64 --queues 8 --count 50000000 --mpwqe
+source: 76.835 Mpps / 39.340 Gb/s
+peer:   rx_packets_phy +200,000,000
+        rx_bytes_phy   +13,600,000,000
         rx_discards_phy +0
 ```
 
@@ -1526,7 +1526,145 @@ Retained implementation choices:
   layout is kept.
 - `mlxnicd_tx_flood_prepare_q()` also prebuilds fixed WQE fields for each SQ
   slot.  Timed TX still updates WQE counter/opcode and CQ-update bit.
+- For `raw-flood --frame-len 64`, the preloaded TX packet ring now uses compact
+  64-byte slots instead of jumbo-oriented 4096-byte slots.  This changed the
+  normal SEND path from about 46 Mpps to about 68 Mpps and made MPWQE useful.
+- SQ creation now sets `allow_multi_pkt_send_wqe`.  This does not make normal
+  SEND slower in the latest checks and is needed for the experimental eMPWQE
+  path.
+- MPWQE now requests completions sparsely: only at raw-flood posted-burst
+  boundaries or when reclaim is needed.  `mlx5_sq_reclaim_cqe()` walks from the
+  old `cons_index` through all WQEs up to the completed WQE so that
+  `flood_pkt_cons` remains correct when intermediate MPWQEs did not request
+  CQEs.
 
 Ineffective experiments already tried: 8192-packet raw-flood bursts, 12/16
 source queues, full-inline 64B with RSS, a public preloaded-burst API, and DPDK
 `testpmd txonly` baselines.
+
+Enhanced MPWQE status:
+
+- `raw-flood --mpwqe` is experimental and currently restricted to
+  `--rss-udp --frame-len 64`.
+- The first eMPWQE encoding tried, `14B inline L2 + 50B data segment`, failed
+  with TX error CQE `syndrome=0x68 vendor=0x02`.
+- The working encoding uses no inline L2 in the MPWQE itself: base DS count 2
+  (`control + Ethernet segment`), data segments at WQE offset `0x20`, and each
+  data segment points to one complete 64B preloaded packet.
+- Current MPWQE rates are below the normal SEND best:
+
+```text
+1 queue: 30.736 / 30.665 Mpps
+2 queues: 36.342 Mpps
+4 queues: 36.336 Mpps
+8 queues: 36.394 Mpps
+```
+
+After compacting the 64B DMA packet ring, MPWQE is the current best path:
+
+```text
+normal SEND, 8 queues: 67.884 / 67.668 / 67.970 Mpps
+MPWQE, 8 queues:       75.777 / 75.917 / 75.692 / 75.704 Mpps
+MPWQE, sparse CQE:     76.611 / 76.586 / 76.481 Mpps
+MPWQE, 200M packets:   76.835 Mpps
+```
+
+Compact-ring MPWQE queue scaling:
+
+```text
+1 queue: 40.164 Mpps
+2 queues: 61.404 Mpps
+4 queues: 73.728 Mpps
+5 queues: 74.747 Mpps
+6 queues: 75.379 Mpps
+7 queues: 75.674 Mpps
+8 queues: 75.917 Mpps best observed
+```
+
+The unsuccessful/safe-to-ignore follow-up was removing the full-WQE `memset()`
+from the MPWQE timed path; it measured 75.813 / 75.625 / 75.570 Mpps and was
+reverted.  The successful follow-up was sparse MPWQE completions, which raised
+the 200M-packet run to 76.835 Mpps with peer `rx_discards_phy +0`.
+
+Further ineffective experiments already tried after sparse CQE:
+
+```text
+MPWQE 16 WQEBBs:
+  1q/1000-packet smoke test fails with TX error CQE syndrome=0x68 vendor=0x02.
+  Keep MLX5_TX_MPWQE_MAX_WQEBBS at 15.
+
+MPWQE 14/13 WQEBBs:
+  14 WQEBBs: 76.579 / 76.495 Mpps.
+  13 WQEBBs: 76.394 / 76.489 Mpps.
+  Both are below the 15-WQEBB 76.835 Mpps best, so keep 15.
+
+raw-flood burst 8192 with compact-ring sparse-CQE MPWQE:
+  76.073 / 76.167 Mpps.
+  Keep MLXNICD_SAMPLE_FLOOD_BURST at 4096.
+
+raw-flood burst 2048/1024 with compact-ring sparse-CQE MPWQE:
+  2048: 76.708 / 76.638 Mpps.
+  1024: 76.418 / 76.403 Mpps.
+  Keep MLXNICD_SAMPLE_FLOOD_BURST at 4096.
+
+source queues 12/16 after compact-ring sparse-CQE MPWQE:
+  12 queues: 76.318 Mpps.
+  16 queues: 76.049 Mpps.
+  Keep MLXNICD_MAX_QUEUES and MLXNICD_SAMPLE_MAX_QUEUES at 8; sdn-svr6 only
+  exposes 8 CPUs and oversubscribing with more SQs did not help.
+
+raw-flood worker pinning:
+  no pinning: 76.708 / 76.825 Mpps.
+  reverse pinning: 76.426 / 76.467 Mpps.
+  Keep explicit queue_id-to-CPU pinning for reproducibility; no-pinning was not
+  a clear improvement and reverse pinning was slower.
+
+MPWQE fixed-length memset experiment:
+  50M-packet runs: 76.666 / 76.980 Mpps.
+  200M-packet run: 76.672 Mpps with peer +200M packets and discard 0.
+  Not retained; the longer run is below the 76.835 Mpps best.
+
+MPWQE dseg loop micro-optimization:
+  Combined `byte_count+mkey` into one 64-bit write and used incrementing IOVA
+  for the non-wrap case.
+  Result: 76.561 / 76.515 Mpps.
+  Not retained.
+
+compiler flags:
+  default `-O2 -g`: retained.
+  `-O3 -g`: 49.208 / 48.775 Mpps, much worse.
+  `-O3 -march=native -g`: 48.647 / 48.384 Mpps, much worse.
+  `-O2 -march=native -g`: 76.686 / 76.423 Mpps, no improvement.
+  `-O2 -flto -g` with `-flto` link: 76.474 / 76.811 Mpps, no improvement.
+  `-O2 -fno-plt -g`: 76.594 / 76.609 Mpps, no improvement.
+
+post-MMIO barrier removal:
+  Removed the final `__sync_synchronize()` after the UAR MMIO write in
+  `mlx5_sq_ring_send()`.
+  50M-packet runs: 76.354 / 76.921 Mpps.
+  200M-packet run: 76.778 Mpps with peer +200M packets and discard 0.
+  Not retained; below 76.835 Mpps long-run best.
+
+perf after sparse CQE:
+  `perf stat` on the retained best path showed 5.284s task-clock over 1.503s
+  wall time, i.e. 3.515 CPUs utilized, 17.967B cycles, 106.874B instructions,
+  IPC 5.95, and very few migrations.
+  `perf record/report` showed samples dominated by CQ polling:
+    61.26% mlx5_poll_cq_once_mode
+    34.02% mlx5_poll_cq.part.0.constprop.0
+     2.78% mlxnicd_tx_mpwqe64_burst_q
+  This points at reclaim/HCA progress/outstanding-depth/device-side behavior
+  rather than MPWQE dseg loop code as the current bottleneck.
+
+TX packet ring 16384 slots:
+  First attempt failed at 8 queues with `VFIO_IOMMU_MAP_DMA: File exists`
+  because the per-queue TX IOVA stride was still 32MiB while the packet ring
+  became 64MiB per queue.
+  After widening TX IOVA queue stride to 128MiB, runs measured
+  76.612 / 76.620 Mpps.
+  Not retained; keep MLX5_TX_DMA_SLOT_COUNT tied to MLX5_SQ_WQE_COUNT.
+```
+
+The next bottleneck is likely source-side per-core TX work, doorbell behavior,
+or HCA scheduling across SQs rather than peer RX drops.  CQE pressure was a
+small but real bottleneck and has already been reduced.

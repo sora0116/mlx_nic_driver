@@ -147,3 +147,21 @@ int mlx5_query_hca_cap(const char *bdf) {
     mlx5_cmd_ctx_close(&ctx);
     return rc;
 }
+
+int mlx5_query_eth_cap(const char *bdf) {
+    struct mlx5_cmd_ctx ctx;
+    int rc;
+
+    if (mlx5_cmd_ctx_open(bdf, &ctx) != 0) {
+        return -1;
+    }
+    rc = mlx5_ctx_enable_hca(&ctx);
+    if (rc == 0) {
+        rc = mlx5_ctx_set_issi(&ctx);
+    }
+    if (rc == 0) {
+        rc = mlx5_ctx_query_eth_cap(&ctx);
+    }
+    mlx5_cmd_ctx_close(&ctx);
+    return rc;
+}

@@ -36,5 +36,6 @@ int mlx5_ctx_set_issi(struct mlx5_cmd_ctx *ctx);
 int mlx5_ctx_enable_hca(struct mlx5_cmd_ctx *ctx);
 int mlx5_ctx_query_pages(struct mlx5_cmd_ctx *ctx, int boot);
 int mlx5_ctx_query_hca_cap(struct mlx5_cmd_ctx *ctx);
+int mlx5_ctx_query_eth_cap(struct mlx5_cmd_ctx *ctx);
 
 #endif

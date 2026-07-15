@@ -15,6 +15,7 @@ int mlx5_info(const char *bdf);
 int mlx5_query_issi(const char *bdf);
 int mlx5_set_issi(const char *bdf);
 int mlx5_query_hca_cap(const char *bdf);
+int mlx5_query_eth_cap(const char *bdf);
 int mlx5_enable_hca(const char *bdf);
 int mlx5_query_pages(const char *bdf, int boot);
 
