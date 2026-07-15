@@ -45,6 +45,7 @@ struct raw_flood_opts {
     uint32_t frame_len;
     uint16_t queue_count;
     int rss_udp;
+    int mpwqe;
     int verbose;
 };
 

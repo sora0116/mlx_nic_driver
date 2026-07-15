@@ -31,7 +31,7 @@ static void usage(FILE *out, const char *argv0) {
             "  %s mlx5-query-hca-cap <BDF>\n"
             "  %s raw-loop --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--rx-count N] [--pre-rx-delay-ms N] [--timeout-ms N] [--verbose]\n"
             "  %s raw-bench --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--count N] [--window N] [--timeout-ms N] [--min-rtt-ns N] [--verbose]\n"
-            "  %s raw-flood --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--frame-len N] [--count N] [--queues N] [--rss-udp] [--verbose]\n"
+            "  %s raw-flood --bdf <BDF> --peer-if <ifname> --src-mac <mac> --dst-mac <mac> --ethertype <hex> [--payload-hex HEX] [--frame-len N] [--count N] [--queues N] [--rss-udp] [--mpwqe] [--verbose]\n"
             "  %s raw-echo --bdf <BDF> --peer-if <ifname> --ethertype <hex> [--count N] [--timeout-ms N] [--verbose]\n"
             "\n"
             "examples:\n"
@@ -382,6 +382,7 @@ int main(int argc, char **argv) {
         opts.frame_len = frame_len;
         opts.queue_count = (uint16_t)queues;
         opts.rss_udp = opt_present(argc, argv, "--rss-udp");
+        opts.mpwqe = opt_present(argc, argv, "--mpwqe");
         opts.verbose = opt_present(argc, argv, "--verbose");
         return raw_flood_run(&opts) == 0 ? 0 : 1;
     }

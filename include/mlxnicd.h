@@ -68,12 +68,15 @@ uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
 uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
                             const struct mlxnicd_pkt *pkts,
                             uint16_t nb_pkts);
-/* Preload a repeating large-frame set into queue-local DMA memory for the
+/* Preload a repeating DMA-backed frame set into queue-local DMA memory for the
  * raw-flood benchmark.  Subsequent packets with data==NULL and the same
  * length reuse that set without a host-side frame copy. */
 int mlxnicd_tx_flood_prepare_q(struct mlxnicd_dev *dev, uint16_t queue_id,
                                 const struct mlxnicd_pkt *pkts,
                                 uint16_t nb_pkts);
+/* Experimental 64B enhanced MPWQE flood path. */
+uint16_t mlxnicd_tx_mpwqe64_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
+                                    uint16_t nb_pkts);
 /* Wait until all submitted TX WQEs on one queue have completed. */
 int mlxnicd_tx_flush_q(struct mlxnicd_dev *dev, uint16_t queue_id);
 /*

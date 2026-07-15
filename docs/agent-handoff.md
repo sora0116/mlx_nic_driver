@@ -1500,3 +1500,33 @@ After DPDK attempts, always rebind the source port to `vfio-pci`; verify with:
 ssh -F /home/sora/.ssh/config sdn-svr6 \
   'readlink /sys/bus/pci/devices/0000:01:00.0/driver'
 ```
+
+## Current 64-byte PPS campaign
+
+The current follow-up target is API-visible 64-byte packet rate.  Details and
+all effective/ineffective attempts are in
+[`docs/benchmark-64b-pps.md`](benchmark-64b-pps.md).
+
+Current best:
+
+```text
+raw-flood --ethertype 0x0800 --rss-udp --frame-len 64 --queues 8 --count 50000000
+source: 45.933 Mpps / 23.518 Gb/s
+peer:   rx_packets_phy +50,000,000
+        rx_bytes_phy   +3,400,000,000
+        rx_discards_phy +0
+```
+
+Retained implementation choices:
+
+- `raw-flood --rss-udp --frame-len 64` builds a minimal IPv4/UDP frame instead
+  of the normal 66-byte benchmark-header frame.
+- 64B and larger TX packets use the one-WQEBB L2-inline + DMA data-segment SEND
+  layout.  A full-inline 64B WQE was measured at only 38.336 Mpps, so the DMA
+  layout is kept.
+- `mlxnicd_tx_flood_prepare_q()` also prebuilds fixed WQE fields for each SQ
+  slot.  Timed TX still updates WQE counter/opcode and CQ-update bit.
+
+Ineffective experiments already tried: 8192-packet raw-flood bursts, 12/16
+source queues, full-inline 64B with RSS, a public preloaded-burst API, and DPDK
+`testpmd txonly` baselines.

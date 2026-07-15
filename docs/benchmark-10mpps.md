@@ -550,3 +550,13 @@ the 50M-packet 4092-byte run as a regression test, add latency measurement that
 does not perturb the throughput path, and extend the same level of validation
 to RX and custom-driver-to-custom-driver operation when a second VFIO-capable
 host is available.
+
+## 64-byte packet-rate follow-up
+
+The 64-byte PPS campaign is tracked separately in
+[`docs/benchmark-64b-pps.md`](benchmark-64b-pps.md).  Current best on the same
+`sdn-svr6 -> sdn-svr7` path is **45.933 Mpps** for API-visible 64-byte packets,
+with `sdn-svr7:eth2` confirming +50,000,000 packets, +3,400,000,000 physical
+bytes, and no discard.  The retained changes are a minimal 64B IPv4/UDP
+`raw-flood --rss-udp` frame and the one-WQEBB L2-inline + DMA data-segment SEND
+path plus prebuilt fixed WQE fields for 64B packets.

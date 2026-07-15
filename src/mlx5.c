@@ -165,12 +165,14 @@ enum {
     MLX5_INLINE_MODE_L2 = 1,
     MLX5_OPCODE_NOP = 0x00,
     MLX5_OPCODE_SEND = 0x0a,
+    MLX5_OPCODE_ENHANCED_MPSW = 0x29,
     MLX5_WQE_CTRL_CQ_UPDATE = 2 << 2,
     MLX5_CQE_REQ_ERR = 13,
     MLX5_CQE_RESP_ERR = 14,
     MLX5_CQ_FAST_POLL_SPINS = 1000000,
     MLX5_TX_TEST_MIN_FRAME = 60,
     MLX5_TX_TEST_MAX_INLINE_FRAME = 98,
+    MLX5_TX_TEST_DMA_MIN_FRAME = 64,
     MLX5_TX_TEST_MAX_FRAME = 4092,
     MLX5_TX_TEST_PORT_MTU = 4096,
     MLX5_TX_DMA_SLOT_SIZE = 4096,
@@ -179,6 +181,8 @@ enum {
     MLX5_TX_DMA_DSEG_OFF = 0x30,
     MLX5_TX_DMA_DS = 4,
     MLX5_TX_DMA_WQEBBS = 1,
+    MLX5_TX_MPWQE_MAX_WQEBBS = 15,
+    MLX5_TX_MPWQE_BASE_DS = 3,
     MLX5_RX_BUFFER_SIZE = 2048,
     MLX5_RX_TEST_POST_COUNT = MLX5_RQ_WQE_COUNT,
     MLX5_RX_TEST_WAIT_COUNT = 20,
@@ -202,6 +206,14 @@ enum {
 #define MLX5_SQ_PAGE_COUNT (MLX5_SQ_DMA_BYTES / MLX5_PAGE_SIZE)
 #define MLX5_RQ_PAGE_COUNT (MLX5_RQ_DMA_BYTES / MLX5_PAGE_SIZE)
 #define MLX5_RX_BUFFER_IOVA_BASE UINT64_C(0x09000000)
+
+static int mlx5_tx_frame_uses_inline(size_t frame_len) {
+    return frame_len < MLX5_TX_TEST_DMA_MIN_FRAME;
+}
+
+static uint32_t mlx5_tx_frame_wqebbs(uint32_t frame_len) {
+    return mlx5_tx_frame_uses_inline(frame_len) ? 2U : MLX5_TX_DMA_WQEBBS;
+}
 
 struct mlx5_dma_page {
     void *addr;
@@ -232,7 +244,11 @@ struct mlx5_sq_res {
     uint32_t cons_index;
     uint32_t flood_frame_len;
     int flood_prepared;
+    int flood_wqe_prepared;
+    uint32_t flood_pkt_prod;
+    uint32_t flood_pkt_cons;
     uint8_t wqebb_count[MLX5_SQ_WQE_COUNT];
+    uint8_t wqe_pkt_count[MLX5_SQ_WQE_COUNT];
     int valid;
 };
 
@@ -2522,7 +2538,17 @@ static int mlx5_sq_prepare_send_raw(uint32_t tisn, uint32_t mkey,
         fprintf(stderr, "invalid TX frame length: %zu\n", frame_len);
         return -1;
     }
-    if (frame_len <= MLX5_TX_TEST_MAX_INLINE_FRAME) {
+    if (!mlx5_tx_frame_uses_inline(frame_len) && frame == NULL &&
+        sq->flood_prepared && sq->flood_wqe_prepared &&
+        sq->flood_frame_len == frame_len) {
+        put_be32(wqe + 0x00, ((pi & 0xffffu) << 8) | MLX5_OPCODE_SEND);
+        wqe[0x0b] = request_completion ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+        sq->prod_index += MLX5_TX_DMA_WQEBBS;
+        sq->wqebb_count[pi & (MLX5_SQ_WQE_COUNT - 1)] = MLX5_TX_DMA_WQEBBS;
+        *wqe_out = wqe;
+        return 0;
+    }
+    if (mlx5_tx_frame_uses_inline(frame_len)) {
         if (frame == NULL) {
             fprintf(stderr, "inline TX requires packet data\n");
             return -1;
@@ -2553,7 +2579,7 @@ static int mlx5_sq_prepare_send_raw(uint32_t tisn, uint32_t mkey,
         }
     }
     memset(wqe, 0, wqebbs << MLX5_SEND_WQE_BB_LOG);
-    if (frame_len > MLX5_TX_TEST_MAX_INLINE_FRAME) {
+    if (!mlx5_tx_frame_uses_inline(frame_len)) {
         put_be16(wqe + 0x1c, MLX5_TX_DMA_INLINE_PREFIX);
         memcpy(wqe + 0x1e, wqe_frame, MLX5_TX_DMA_INLINE_PREFIX);
         put_be32(wqe + MLX5_TX_DMA_DSEG_OFF + 0x00,
@@ -2567,7 +2593,7 @@ static int mlx5_sq_prepare_send_raw(uint32_t tisn, uint32_t mkey,
     wqe[0x0b] = request_completion ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
     put_be32(wqe + 0x0c, tisn & 0x00ffffffu);
 
-    if (frame_len <= MLX5_TX_TEST_MAX_INLINE_FRAME) {
+    if (mlx5_tx_frame_uses_inline(frame_len)) {
         put_be16(wqe + 0x1c, (uint16_t)frame_len);
         memcpy(wqe + 0x1e, frame, 2);
         memcpy(wqe + 0x20, frame + 2, frame_len - 2);
@@ -2575,12 +2601,13 @@ static int mlx5_sq_prepare_send_raw(uint32_t tisn, uint32_t mkey,
 
     sq->prod_index += wqebbs;
     sq->wqebb_count[pi & (MLX5_SQ_WQE_COUNT - 1)] = (uint8_t)wqebbs;
+    sq->wqe_pkt_count[pi & (MLX5_SQ_WQE_COUNT - 1)] = 1;
     if (!g_mlx5_stdout_quiet) {
         printf("  prepare SEND WQE: sqn=%" PRIu32 " tisn=%" PRIu32
                " %s_len=%zu pi=%" PRIu32 " new_pi=%" PRIu32
                " completion=%d\n",
                sq->sqn, tisn,
-               frame_len <= MLX5_TX_TEST_MAX_INLINE_FRAME ? "inline" : "dma",
+               mlx5_tx_frame_uses_inline(frame_len) ? "inline" : "dma",
                frame_len, pi, sq->prod_index,
                request_completion);
         if (frame != NULL) {
@@ -2624,6 +2651,7 @@ static void mlx5_sq_reclaim_cqe(struct mlx5_sq_res *sq,
                          (uint32_t)wqe_counter;
 
     uint8_t wqebbs;
+    uint8_t pkts;
 
     /* The CQE reports the first WQEBB of the completed WQE.  Reconstruct its
      * 32-bit generation and advance by the WQE's recorded ring size. */
@@ -2634,7 +2662,12 @@ static void mlx5_sq_reclaim_cqe(struct mlx5_sq_res *sq,
     if (wqebbs == 0) {
         wqebbs = 1;
     }
+    pkts = sq->wqe_pkt_count[completed & (MLX5_SQ_WQE_COUNT - 1)];
+    if (pkts == 0) {
+        pkts = 1;
+    }
     sq->cons_index = completed + wqebbs;
+    sq->flood_pkt_cons += pkts;
 }
 
 static int mlx5_sq_poll_tx_cq(struct mlx5_cq_res *cq, struct mlx5_sq_res *sq,
@@ -3205,13 +3238,10 @@ uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
             continue;
         }
 
-        /* Select as many packets as fit in the SQ.  Inline frames use two
-         * WQEBBs; a data-segment WQE uses one.  Treating all packets as
-         * two-WQEBB had needlessly split large-frame DMA floods. */
+        /* Select as many packets as fit in the SQ.  Very small inline frames
+         * use two WQEBBs; the L2-inline + data-segment path uses one. */
         while ((uint16_t)(sent + batch) < nb_pkts) {
-            uint32_t packet_wqebbs =
-                pkts[sent + batch].len <= MLX5_TX_TEST_MAX_INLINE_FRAME ?
-                    2 : MLX5_TX_DMA_WQEBBS;
+            uint32_t packet_wqebbs = mlx5_tx_frame_wqebbs(pkts[sent + batch].len);
 
             if (batch_wqebbs + packet_wqebbs > available_wqebbs) {
                 break;
@@ -3267,9 +3297,13 @@ int mlxnicd_tx_flood_prepare_q(struct mlxnicd_dev *dev, uint16_t queue_id,
         const struct mlxnicd_pkt *pkt = &pkts[slot % nb_pkts];
         uint8_t *dst = (uint8_t *)sq->tx_page.addr +
                        (size_t)slot * MLX5_TX_DMA_SLOT_SIZE;
+        uint8_t *wqe = (uint8_t *)sq->sq_page.addr +
+                       (slot << MLX5_SEND_WQE_BB_LOG);
+        uint64_t tx_iova = sq->tx_page.iova +
+                            (uint64_t)slot * MLX5_TX_DMA_SLOT_SIZE;
 
         if (pkt->data == NULL ||
-            pkt->len <= MLX5_TX_TEST_MAX_INLINE_FRAME ||
+            mlx5_tx_frame_uses_inline(pkt->len) ||
             pkt->len > MLX5_TX_TEST_MAX_FRAME) {
             return -1;
         }
@@ -3283,9 +3317,155 @@ int mlxnicd_tx_flood_prepare_q(struct mlxnicd_dev *dev, uint16_t queue_id,
         memcpy(dst + MLX5_TX_DMA_DATA_OFFSET,
                pkt->data + MLX5_TX_DMA_INLINE_PREFIX,
                pkt->len - MLX5_TX_DMA_INLINE_PREFIX);
+
+        memset(wqe, 0, 1U << MLX5_SEND_WQE_BB_LOG);
+        put_be32(wqe + 0x04, ((sq->sqn & 0x00ffffffu) << 8) | MLX5_TX_DMA_DS);
+        put_be32(wqe + 0x0c, dev->rt.tisn & 0x00ffffffu);
+        put_be16(wqe + 0x1c, MLX5_TX_DMA_INLINE_PREFIX);
+        memcpy(wqe + 0x1e, dst, MLX5_TX_DMA_INLINE_PREFIX);
+        put_be32(wqe + MLX5_TX_DMA_DSEG_OFF + 0x00,
+                 pkt->len - MLX5_TX_DMA_INLINE_PREFIX);
+        put_be32(wqe + MLX5_TX_DMA_DSEG_OFF + 0x04, dev->rt.mkey);
+        put_be64(wqe + MLX5_TX_DMA_DSEG_OFF + 0x08,
+                 tx_iova + MLX5_TX_DMA_DATA_OFFSET);
+        sq->wqebb_count[slot] = MLX5_TX_DMA_WQEBBS;
     }
     sq->flood_prepared = 1;
+    sq->flood_wqe_prepared = 1;
+    sq->flood_pkt_prod = 0;
+    sq->flood_pkt_cons = 0;
     return 0;
+}
+
+uint16_t mlxnicd_tx_mpwqe64_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
+                                    uint16_t nb_pkts) {
+    struct mlx5_sq_res *sq;
+    uint16_t sent = 0;
+
+    if (dev == NULL || !dev->started ||
+        (dev->config.flags & MLXNICD_DEV_F_TX) == 0) {
+        return 0;
+    }
+    if (queue_id >= dev->rt.queue_count) {
+        dev->last_error = MLXNICD_ERR_INVAL;
+        return 0;
+    }
+    sq = &dev->rt.sq[queue_id];
+    if (!sq->flood_prepared || sq->flood_frame_len != 64) {
+        dev->last_error = MLXNICD_ERR_STATE;
+        return 0;
+    }
+
+    while (sent < nb_pkts) {
+        uint8_t *last_wqe = NULL;
+        uint32_t used_wqebbs = sq->prod_index - sq->cons_index;
+        uint32_t used_pkts = sq->flood_pkt_prod - sq->flood_pkt_cons;
+        uint32_t available_wqebbs;
+        uint32_t available_pkts;
+        uint32_t contig_wqebbs;
+        uint32_t mpwqe_wqebbs;
+        uint32_t ds_max;
+        uint32_t pkt_cap;
+        uint16_t pkt_count;
+        uint32_t pi;
+        uint8_t *wqe;
+
+        if (used_wqebbs > MLX5_SQ_WQE_COUNT ||
+            used_pkts > MLX5_TX_DMA_SLOT_COUNT) {
+            dev->last_error = MLXNICD_ERR_IO;
+            return sent;
+        }
+        available_wqebbs = MLX5_SQ_WQE_COUNT - used_wqebbs;
+        available_pkts = MLX5_TX_DMA_SLOT_COUNT - used_pkts;
+        if (available_wqebbs == 0 || available_pkts == 0) {
+            if (mlx5_sq_poll_tx_cq(&dev->rt.tx_cq[queue_id], sq, 1) <= 0) {
+                dev->last_error = MLXNICD_ERR_IO;
+                return sent;
+            }
+            continue;
+        }
+
+        pi = sq->prod_index & (MLX5_SQ_WQE_COUNT - 1);
+        contig_wqebbs = MLX5_SQ_WQE_COUNT - pi;
+        mpwqe_wqebbs = MLX5_TX_MPWQE_MAX_WQEBBS;
+        if (mpwqe_wqebbs > contig_wqebbs) {
+            mpwqe_wqebbs = contig_wqebbs;
+        }
+        if (mpwqe_wqebbs > available_wqebbs) {
+            mpwqe_wqebbs = available_wqebbs;
+        }
+        ds_max = mpwqe_wqebbs * 4U;
+        if (ds_max <= MLX5_TX_MPWQE_BASE_DS) {
+            if (mlx5_sq_poll_tx_cq(&dev->rt.tx_cq[queue_id], sq, 1) <= 0) {
+                dev->last_error = MLXNICD_ERR_IO;
+                return sent;
+            }
+            continue;
+        }
+        pkt_cap = ds_max - MLX5_TX_MPWQE_BASE_DS;
+        if (pkt_cap > available_pkts) {
+            pkt_cap = available_pkts;
+        }
+        if (pkt_cap > (uint32_t)(nb_pkts - sent)) {
+            pkt_cap = (uint32_t)(nb_pkts - sent);
+        }
+        if (pkt_cap > UINT8_MAX) {
+            pkt_cap = UINT8_MAX;
+        }
+        pkt_count = (uint16_t)pkt_cap;
+        if (pkt_count == 0) {
+            return sent;
+        }
+        mpwqe_wqebbs =
+            (MLX5_TX_MPWQE_BASE_DS + (uint32_t)pkt_count + 3U) / 4U;
+
+        wqe = (uint8_t *)sq->sq_page.addr + (pi << MLX5_SEND_WQE_BB_LOG);
+        memset(wqe, 0, mpwqe_wqebbs << MLX5_SEND_WQE_BB_LOG);
+        put_be16(wqe + 0x1c, MLX5_TX_DMA_INLINE_PREFIX);
+        {
+            uint32_t first_slot = sq->flood_pkt_prod & (MLX5_TX_DMA_SLOT_COUNT - 1);
+            uint8_t *first = (uint8_t *)sq->tx_page.addr +
+                             (size_t)first_slot * MLX5_TX_DMA_SLOT_SIZE;
+            memcpy(wqe + 0x1e, first, MLX5_TX_DMA_INLINE_PREFIX);
+        }
+        for (uint16_t i = 0; i < pkt_count; i++) {
+            uint32_t slot = (sq->flood_pkt_prod + i) &
+                            (MLX5_TX_DMA_SLOT_COUNT - 1);
+            uint8_t *dseg = wqe + 0x30 + (size_t)i * 16U;
+            uint64_t tx_iova = sq->tx_page.iova +
+                                (uint64_t)slot * MLX5_TX_DMA_SLOT_SIZE;
+
+            put_be32(dseg + 0x00, 64U - MLX5_TX_DMA_INLINE_PREFIX);
+            put_be32(dseg + 0x04, dev->rt.mkey);
+            put_be64(dseg + 0x08, tx_iova + MLX5_TX_DMA_DATA_OFFSET);
+        }
+        put_be32(wqe + 0x00,
+                 ((sq->prod_index & 0xffffu) << 8) | MLX5_OPCODE_ENHANCED_MPSW);
+        put_be32(wqe + 0x04,
+                 ((sq->sqn & 0x00ffffffu) << 8) |
+                 (MLX5_TX_MPWQE_BASE_DS + pkt_count));
+        wqe[0x0b] = MLX5_WQE_CTRL_CQ_UPDATE;
+        put_be32(wqe + 0x0c, dev->rt.tisn & 0x00ffffffu);
+
+        sq->wqebb_count[pi] = (uint8_t)mpwqe_wqebbs;
+        sq->wqe_pkt_count[pi] = (uint8_t)pkt_count;
+        sq->prod_index += mpwqe_wqebbs;
+        sq->flood_pkt_prod += pkt_count;
+        sent = (uint16_t)(sent + pkt_count);
+        last_wqe = wqe;
+
+        if (sent == nb_pkts || available_wqebbs == mpwqe_wqebbs ||
+            available_pkts == pkt_count) {
+            if (mlx5_sq_ring_send(&dev->rt.ctx, dev->rt.uar, sq, last_wqe) != 0) {
+                dev->last_error = MLXNICD_ERR_IO;
+                return sent;
+            }
+        }
+    }
+    if (sent == nb_pkts) {
+        dev->last_error = MLXNICD_OK;
+    }
+    return sent;
 }
 
 int mlxnicd_tx_flush_q(struct mlxnicd_dev *dev, uint16_t queue_id) {

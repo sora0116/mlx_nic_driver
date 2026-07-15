@@ -80,6 +80,10 @@ int raw_flood_run(const struct raw_flood_opts *opts) {
         fprintf(stderr, "--rss-udp requires --ethertype 0x0800\n");
         bad = 1;
     }
+    if (opts->mpwqe && (!opts->rss_udp || opts->frame_len != 64)) {
+        fprintf(stderr, "--mpwqe currently requires --rss-udp --frame-len 64\n");
+        bad = 1;
+    }
     if (bad) {
         return -1;
     }

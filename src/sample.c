@@ -24,11 +24,13 @@ enum {
     MLXNICD_SAMPLE_RX_WAIT_COUNT = 20,
     MLXNICD_SAMPLE_BENCH_MAGIC = 0x4d4c5842,
     MLXNICD_SAMPLE_BENCH_HDR_LEN = 24,
-    /* A full-inline frame consumes two 64-byte SQ WQEBBs; SQ has 2048. */
+    /* Full-inline frames consume two 64-byte SQ WQEBBs.  raw-flood uses the
+     * one-WQEBB L2-inline + DMA data-segment path for 64B and larger frames. */
     MLXNICD_SAMPLE_BENCH_MAX_WINDOW = 4096,
     MLXNICD_SAMPLE_BENCH_RX_BURST = 128,
     MLXNICD_SAMPLE_BENCH_RX_POST_COUNT = 4096,
     MLXNICD_SAMPLE_FLOOD_BURST = 4096,
+    MLXNICD_SAMPLE_MAX_QUEUES = 8,
     MLXNICD_SAMPLE_BENCH_F_REPLY = 0x0001,
 };
 
@@ -79,6 +81,7 @@ struct sample_flood_ctx {
     const struct raw_bench_opts *frame_opts;
     const uint8_t *template_frame;
     uint32_t frame_len;
+    int mpwqe;
     atomic_int go;
     atomic_int failed;
 };
@@ -394,9 +397,51 @@ static void sample_bench_build_from_template(const struct raw_bench_opts *opts,
         sample_put_be16(ip + 10, sample_ipv4_checksum(ip, 20));
         sample_put_be16(udp, (uint16_t)(10000u + (seq % 50000u)));
     }
+    if (template_len < header_off + MLXNICD_SAMPLE_BENCH_HDR_LEN) {
+        return;
+    }
     sample_put_be16(frame + header_off + 6, flags);
     sample_put_be32(frame + header_off + 8, seq);
     sample_put_be64(frame + header_off + 12, send_ns);
+}
+
+static int sample_raw_flood_build_minimal_rss_udp(
+    const struct raw_bench_opts *opts, uint8_t *frame, size_t frame_cap,
+    uint32_t frame_len) {
+    uint8_t dst[6];
+    uint8_t src[6];
+    uint8_t *ip;
+    uint8_t *udp;
+
+    if (opts == NULL || frame == NULL || frame_len < 60 || frame_len > frame_cap) {
+        return -1;
+    }
+    if (sample_parse_mac_addr(opts->dst_mac, dst) != 0 ||
+        sample_parse_mac_addr(opts->src_mac, src) != 0) {
+        return -1;
+    }
+    if (frame_len < 14 + 20 + 8) {
+        return -1;
+    }
+    memset(frame, 0, frame_cap);
+    memcpy(frame + 0, dst, sizeof(dst));
+    memcpy(frame + 6, src, sizeof(src));
+    sample_put_be16(frame + 12, 0x0800);
+
+    ip = frame + 14;
+    udp = ip + 20;
+    ip[0] = 0x45;
+    sample_put_be16(ip + 2, (uint16_t)(frame_len - 14));
+    sample_put_be16(ip + 6, 0x4000);
+    ip[8] = 64;
+    ip[9] = 17;
+    ip[12] = 192; ip[13] = 0; ip[14] = 2; ip[15] = 6;
+    ip[16] = 192; ip[17] = 0; ip[18] = 2; ip[19] = 5;
+    sample_put_be16(ip + 10, sample_ipv4_checksum(ip, 20));
+    sample_put_be16(udp, 10000);
+    sample_put_be16(udp + 2, 20000);
+    sample_put_be16(udp + 4, (uint16_t)(frame_len - 14 - 20));
+    return 0;
 }
 
 static int sample_bench_is_reflection_fast(const struct sample_parallel_ctx *ctx,
@@ -472,8 +517,8 @@ static int sample_raw_bench_parallel(struct mlxnicd_dev *dev,
     struct sample_parallel_ctx ctx = {.dev = dev, .opts = opts,
                                       .template_frame = frame_template,
                                       .frame_len = frame_len};
-    struct sample_parallel_worker workers[8] = {{0}};
-    pthread_t threads[8];
+    struct sample_parallel_worker workers[MLXNICD_SAMPLE_MAX_QUEUES] = {{0}};
+    pthread_t threads[MLXNICD_SAMPLE_MAX_QUEUES];
     uint64_t start_ns = sample_now_ns();
     uint64_t total_sent = 0;
     uint64_t total_received = 0;
@@ -542,7 +587,7 @@ static void *sample_raw_flood_worker(void *arg) {
         return NULL;
     }
     /* raw-flood measures the TX datapath, not packet construction.  Build a
-     * worker-private, RSS-diverse set once and reuse it.  The 4,096 source
+     * worker-private, RSS-diverse set once and reuse it.  The prebuilt source
      * ports are sufficient to spread traffic across the peer's queues while
      * avoiding a 1514-byte template copy and IPv4 checksum per packet in the
      * timed region. */
@@ -553,7 +598,7 @@ static void *sample_raw_flood_worker(void *arg) {
         tx[i].data = frames[i];
         tx[i].len = ctx->frame_len;
     }
-    if (ctx->frame_len > 98 &&
+    if (ctx->frame_len >= 64 &&
         mlxnicd_tx_flood_prepare_q(ctx->dev, worker->queue_id, tx,
                                    MLXNICD_SAMPLE_FLOOD_BURST) != 0) {
         atomic_store_explicit(&ctx->failed, 1, memory_order_relaxed);
@@ -561,7 +606,7 @@ static void *sample_raw_flood_worker(void *arg) {
         free(frames);
         return NULL;
     }
-    if (ctx->frame_len > 98) {
+    if (ctx->frame_len >= 64) {
         for (uint32_t i = 0; i < MLXNICD_SAMPLE_FLOOD_BURST; i++) {
             tx[i].data = NULL;
         }
@@ -576,8 +621,11 @@ static void *sample_raw_flood_worker(void *arg) {
         if (batch > MLXNICD_SAMPLE_FLOOD_BURST) {
             batch = MLXNICD_SAMPLE_FLOOD_BURST;
         }
-        if (mlxnicd_tx_burst_q(ctx->dev, worker->queue_id, tx,
-                               (uint16_t)batch) != batch) {
+        if ((ctx->mpwqe ?
+             mlxnicd_tx_mpwqe64_burst_q(ctx->dev, worker->queue_id,
+                                        (uint16_t)batch) :
+             mlxnicd_tx_burst_q(ctx->dev, worker->queue_id, tx,
+                                (uint16_t)batch)) != batch) {
             atomic_store_explicit(&ctx->failed, 1, memory_order_relaxed);
             break;
         }
@@ -597,8 +645,8 @@ int sample_raw_flood(const struct raw_flood_opts *opts) {
     struct mlxnicd_dev *dev = NULL;
     struct mlxnicd_dev_config config;
     struct sample_flood_ctx ctx = {0};
-    struct sample_flood_worker workers[8] = {{0}};
-    pthread_t threads[8];
+    struct sample_flood_worker workers[MLXNICD_SAMPLE_MAX_QUEUES] = {{0}};
+    pthread_t threads[MLXNICD_SAMPLE_MAX_QUEUES];
     uint8_t frame_template[MLXNICD_SAMPLE_FLOOD_FRAME_CAPACITY];
     uint32_t frame_len = 0;
     uint64_t start_ns;
@@ -607,6 +655,11 @@ int sample_raw_flood(const struct raw_flood_opts *opts) {
     int rc = -1;
 
     if (opts == NULL) return -1;
+    if (opts->queue_count == 0 || opts->queue_count > MLXNICD_SAMPLE_MAX_QUEUES) {
+        fprintf(stderr, "--queues must be in the range 1..%u\n",
+                MLXNICD_SAMPLE_MAX_QUEUES);
+        return -1;
+    }
     frame_opts.bdf = opts->bdf;
     frame_opts.peer_if = opts->peer_if;
     frame_opts.src_mac = opts->src_mac;
@@ -622,14 +675,24 @@ int sample_raw_flood(const struct raw_flood_opts *opts) {
         uint8_t *ip;
         uint8_t *udp;
 
-        if (opts->frame_len < frame_len ||
-            opts->frame_len > MLXNICD_SAMPLE_FLOOD_FRAME_CAPACITY) {
+        if (opts->frame_len < frame_len && opts->rss_udp &&
+            opts->frame_len >= 64) {
+            if (sample_raw_flood_build_minimal_rss_udp(
+                    &frame_opts, frame_template, sizeof(frame_template),
+                    opts->frame_len) != 0) {
+                fprintf(stderr, "failed to build minimal RSS/UDP frame\n");
+                return -1;
+            }
+            frame_len = opts->frame_len;
+        } else if (opts->frame_len < frame_len ||
+                   opts->frame_len > MLXNICD_SAMPLE_FLOOD_FRAME_CAPACITY) {
             fprintf(stderr, "--frame-len must be in the range %u..%u\n",
                     frame_len, MLXNICD_SAMPLE_FLOOD_FRAME_CAPACITY);
             return -1;
+        } else {
+            memset(frame_template + frame_len, 0, opts->frame_len - frame_len);
+            frame_len = opts->frame_len;
         }
-        memset(frame_template + frame_len, 0, opts->frame_len - frame_len);
-        frame_len = opts->frame_len;
         if (opts->rss_udp) {
             ip = frame_template + 14;
             udp = ip + 20;
@@ -660,6 +723,7 @@ int sample_raw_flood(const struct raw_flood_opts *opts) {
     ctx.frame_opts = &frame_opts;
     ctx.template_frame = frame_template;
     ctx.frame_len = frame_len;
+    ctx.mpwqe = opts->mpwqe;
     for (uint16_t q = 0; q < opts->queue_count; q++) {
         workers[q].ctx = &ctx;
         workers[q].queue_id = q;
