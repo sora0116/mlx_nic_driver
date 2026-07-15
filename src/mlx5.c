@@ -67,6 +67,7 @@ enum {
     MLX5_CMD_OP_SET_HCA_CAP = 0x109,
     MLX5_CMD_OP_ACCESS_REG = 0x805,
     MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT = 0x755,
+    MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT = 0x754,
     MLX5_CMD_OP_ALLOC_Q_COUNTER = 0x771,
     MLX5_CMD_OP_DEALLOC_Q_COUNTER = 0x772,
     MLX5_CMD_OP_ALLOC_PD = 0x800,
@@ -101,8 +102,10 @@ enum {
     MLX5_HCA_CAP_SIZE = 4096,
     MLX5_HCA_CAP_OUT_SIZE = 4112,
     MLX5_HCA_CAP_OUT_CAP_OFF = 0x10,
+    MLX5_ACCESS_REG_WRITE = 0,
     MLX5_ACCESS_REG_READ = 1,
     MLX5_REG_DTOR = 0xc00e,
+    MLX5_REG_PMTU = 0x5003,
     MLX5_REG_PAOS = 0x5006,
     MLX5_REG_PPCNT = 0x5008,
     MLX5_PPCNT_REG_SIZE = 0x800,
@@ -168,6 +171,14 @@ enum {
     MLX5_CQ_FAST_POLL_SPINS = 1000000,
     MLX5_TX_TEST_MIN_FRAME = 60,
     MLX5_TX_TEST_MAX_INLINE_FRAME = 98,
+    MLX5_TX_TEST_MAX_FRAME = 4092,
+    MLX5_TX_TEST_PORT_MTU = 4096,
+    MLX5_TX_DMA_SLOT_SIZE = 4096,
+    MLX5_TX_DMA_INLINE_PREFIX = 14,
+    MLX5_TX_DMA_DATA_OFFSET = 16,
+    MLX5_TX_DMA_DSEG_OFF = 0x30,
+    MLX5_TX_DMA_DS = 4,
+    MLX5_TX_DMA_WQEBBS = 1,
     MLX5_RX_BUFFER_SIZE = 2048,
     MLX5_RX_TEST_POST_COUNT = MLX5_RQ_WQE_COUNT,
     MLX5_RX_TEST_WAIT_COUNT = 20,
@@ -182,6 +193,10 @@ enum {
 #define MLX5_PAGE_SIZE 4096U
 #define MLX5_CQ_DMA_BYTES (MLX5_CQ_CQE_COUNT * MLX5_CQE_SIZE)
 #define MLX5_SQ_DMA_BYTES (MLX5_SQ_WQE_COUNT * (1U << MLX5_SEND_WQE_BB_LOG))
+/* A DMA-backed SEND consumes one WQEBB.  Retain one packet buffer per SQ
+ * WQEBB so a producer never overwrites data which the HCA may still read. */
+#define MLX5_TX_DMA_SLOT_COUNT MLX5_SQ_WQE_COUNT
+#define MLX5_TX_DMA_BYTES (MLX5_TX_DMA_SLOT_COUNT * MLX5_TX_DMA_SLOT_SIZE)
 #define MLX5_RQ_DMA_BYTES (MLX5_RQ_WQE_COUNT * 16U)
 #define MLX5_CQ_PAGE_COUNT (MLX5_CQ_DMA_BYTES / MLX5_PAGE_SIZE)
 #define MLX5_SQ_PAGE_COUNT (MLX5_SQ_DMA_BYTES / MLX5_PAGE_SIZE)
@@ -215,6 +230,9 @@ struct mlx5_sq_res {
     uint32_t sqn;
     uint32_t prod_index;
     uint32_t cons_index;
+    uint32_t flood_frame_len;
+    int flood_prepared;
+    uint8_t wqebb_count[MLX5_SQ_WQE_COUNT];
     int valid;
 };
 
@@ -908,6 +926,56 @@ static int mlx5_ctx_query_paos(struct mlx5_cmd_ctx *ctx, uint8_t local_port) {
     return rc;
 }
 
+static int mlx5_ctx_query_pmtu(struct mlx5_cmd_ctx *ctx, uint8_t local_port,
+                               uint16_t *admin_mtu, uint16_t *max_mtu,
+                               uint16_t *oper_mtu) {
+    uint8_t in[16 + 16] = {0};
+    uint8_t out[16 + 16] = {0};
+    uint8_t *reg = in + 16;
+    const uint8_t *oreg = out + 16;
+    int rc;
+
+    put_be16(in, MLX5_CMD_OP_ACCESS_REG);
+    put_be16(in + 0x06, MLX5_ACCESS_REG_READ);
+    put_be16(in + 0x0a, MLX5_REG_PMTU);
+    reg[0x01] = local_port;
+
+    rc = mlx5_cmd_exec(ctx, MLX5_CMD_OP_ACCESS_REG, in, sizeof(in), out,
+                       sizeof(out), "api-query-pmtu");
+    if (rc != 0) {
+        return rc;
+    }
+    if (max_mtu != NULL) {
+        *max_mtu = get_be16(oreg + 0x04);
+    }
+    if (admin_mtu != NULL) {
+        *admin_mtu = get_be16(oreg + 0x08);
+    }
+    if (oper_mtu != NULL) {
+        *oper_mtu = get_be16(oreg + 0x0c);
+    }
+    printf("  pmtu local_port: %u\n", oreg[0x01]);
+    printf("  pmtu max_mtu: %u\n", get_be16(oreg + 0x04));
+    printf("  pmtu admin_mtu: %u\n", get_be16(oreg + 0x08));
+    printf("  pmtu oper_mtu: %u\n", get_be16(oreg + 0x0c));
+    return 0;
+}
+
+static int mlx5_ctx_set_pmtu(struct mlx5_cmd_ctx *ctx, uint8_t local_port,
+                             uint16_t mtu) {
+    uint8_t in[16 + 16] = {0};
+    uint8_t out[16 + 16] = {0};
+    uint8_t *reg = in + 16;
+
+    put_be16(in, MLX5_CMD_OP_ACCESS_REG);
+    put_be16(in + 0x06, MLX5_ACCESS_REG_WRITE);
+    put_be16(in + 0x0a, MLX5_REG_PMTU);
+    reg[0x01] = local_port;
+    put_be16(reg + 0x08, mtu);
+    return mlx5_cmd_exec(ctx, MLX5_CMD_OP_ACCESS_REG, in, sizeof(in), out,
+                         sizeof(out), "api-set-pmtu");
+}
+
 static __attribute__((unused)) int
 mlx5_ctx_query_ppcnt_802_3(struct mlx5_cmd_ctx *ctx, uint8_t local_port,
                            const char *tag) {
@@ -1105,7 +1173,10 @@ static int mlx5_ctx_create_pa_mkey(struct mlx5_cmd_ctx *ctx, uint32_t pd,
     int rc;
 
     put_be16(in, MLX5_CMD_OP_CREATE_MKEY);
-    mkc[0x02] |= 0x18; /* lw=1, lr=1 */
+    /* mkc bit 0x08 is lw (local write), and 0x04 is lr (local read).
+     * RX only exercised lw, while non-inline TX needs lr to DMA-read the
+     * packet buffer. */
+    mkc[0x02] |= 0x0c; /* lw=1, lr=1 */
     mkc[0x04] = 0xff; /* qpn = 0xffffff */
     mkc[0x05] = 0xff;
     mkc[0x06] = 0xff;
@@ -1158,6 +1229,35 @@ static int mlx5_ctx_enable_vport_promisc(struct mlx5_cmd_ctx *ctx) {
     return mlx5_cmd_exec(ctx, MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT, in,
                          sizeof(in), out, sizeof(out),
                          "seq-enable-vport-promisc");
+}
+
+static int mlx5_ctx_set_vport_mtu(struct mlx5_cmd_ctx *ctx, uint16_t mtu) {
+    uint8_t in[0x200] = {0};
+    uint8_t out[16] = {0};
+
+    put_be16(in, MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT);
+    /* field_select.mtu is bit 25 of the dword at input byte 0x0c. */
+    put_be32(in + 0x0c, 1u << 6);
+    /* nic_vport_context begins at input byte 0x100; mtu is bit 0x130. */
+    put_be16(in + 0x126, mtu);
+    return mlx5_cmd_exec(ctx, MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT, in,
+                         sizeof(in), out, sizeof(out), "api-set-vport-mtu");
+}
+
+static __attribute__((unused)) int
+mlx5_ctx_query_vport_mtu(struct mlx5_cmd_ctx *ctx, uint16_t *mtu) {
+    uint8_t in[16] = {0};
+    uint8_t out[0x200] = {0};
+    int rc;
+
+    put_be16(in, MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT);
+    rc = mlx5_cmd_exec(ctx, MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT, in, sizeof(in),
+                       out, sizeof(out), "api-query-vport-mtu");
+    if (rc == 0 && mtu != NULL) {
+        *mtu = get_be16(out + 0x36);
+        printf("  vport mtu: %u\n", *mtu);
+    }
+    return rc;
 }
 
 static int mlx5_ctx_create_eq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
@@ -1299,7 +1399,7 @@ static int mlx5_ctx_create_sq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
     uint8_t *wq = sqc + MLX5_SQC_WQ_OFF;
     const uint64_t sq_iova = 0x05000000ULL + (uint64_t)queue_id * 0x00100000ULL;
     const uint64_t dbr_iova = sq_iova + 0x00080000ULL;
-    const uint64_t tx_iova = sq_iova + 0x00081000ULL;
+    const uint64_t tx_iova = 0x0a000000ULL + (uint64_t)queue_id * 0x02000000ULL;
     int rc;
 
     memset(sq, 0, sizeof(*sq));
@@ -1315,7 +1415,8 @@ static int mlx5_ctx_create_sq(struct mlx5_cmd_ctx *ctx, uint32_t uar,
         mlx5_dma_page_free(ctx, &sq->sq_page);
         return -1;
     }
-    if (mlx5_dma_page_alloc(ctx, &sq->tx_page, tx_iova, "TX packet") != 0) {
+    if (mlx5_dma_region_alloc(ctx, &sq->tx_page, tx_iova,
+                              MLX5_TX_DMA_BYTES, "TX packet ring") != 0) {
         mlx5_dma_page_free(ctx, &sq->dbr_page);
         mlx5_dma_page_free(ctx, &sq->sq_page);
         return -1;
@@ -2412,40 +2513,79 @@ static int mlx5_sq_prepare_send_raw(uint32_t tisn, uint32_t mkey,
                     MLX5_SEND_WQE_BB_LOG);
     uint32_t pi = sq->prod_index;
     uint32_t ds;
-    uint32_t wqebbs;
-    (void)mkey;
+    uint32_t wqebbs = 2;
+    uint64_t tx_iova = 0;
+    const uint8_t *wqe_frame = frame;
 
     if (frame_len < MLX5_TX_TEST_MIN_FRAME ||
-        frame_len > MLX5_TX_TEST_MAX_INLINE_FRAME) {
+        frame_len > MLX5_TX_TEST_MAX_FRAME) {
         fprintf(stderr, "invalid TX frame length: %zu\n", frame_len);
         return -1;
     }
-    ds = (uint32_t)((30 + frame_len + 15) / 16);
-    wqebbs = (ds + 3) / 4;
-    if (wqebbs != 2) {
-        fprintf(stderr, "unexpected full-inline WQEBB count: ds=%" PRIu32
-                " wqebbs=%" PRIu32 "\n",
-                ds, wqebbs);
-        return -1;
+    if (frame_len <= MLX5_TX_TEST_MAX_INLINE_FRAME) {
+        if (frame == NULL) {
+            fprintf(stderr, "inline TX requires packet data\n");
+            return -1;
+        }
+        ds = (uint32_t)((30 + frame_len + 15) / 16);
+        wqebbs = (ds + 3) / 4;
+    } else {
+        uint32_t slot = pi & (MLX5_TX_DMA_SLOT_COUNT - 1);
+        uint8_t *tx_buffer = (uint8_t *)sq->tx_page.addr +
+                             (size_t)slot * MLX5_TX_DMA_SLOT_SIZE;
+        tx_iova = sq->tx_page.iova +
+                  (uint64_t)slot * MLX5_TX_DMA_SLOT_SIZE;
+
+        /* The SQ requires an inline L2 header (min_inline_mode=L2).  Put the
+         * remaining payload in one DMA data segment. */
+        ds = MLX5_TX_DMA_DS;
+        wqebbs = MLX5_TX_DMA_WQEBBS;
+        if (frame != NULL) {
+            memcpy(tx_buffer, frame, MLX5_TX_DMA_INLINE_PREFIX);
+            memcpy(tx_buffer + MLX5_TX_DMA_DATA_OFFSET,
+                   frame + MLX5_TX_DMA_INLINE_PREFIX,
+                   frame_len - MLX5_TX_DMA_INLINE_PREFIX);
+        } else if (!sq->flood_prepared || sq->flood_frame_len != frame_len) {
+            fprintf(stderr, "DMA TX frame is absent and no matching flood set is prepared\n");
+            return -1;
+        } else {
+            wqe_frame = tx_buffer;
+        }
     }
     memset(wqe, 0, wqebbs << MLX5_SEND_WQE_BB_LOG);
+    if (frame_len > MLX5_TX_TEST_MAX_INLINE_FRAME) {
+        put_be16(wqe + 0x1c, MLX5_TX_DMA_INLINE_PREFIX);
+        memcpy(wqe + 0x1e, wqe_frame, MLX5_TX_DMA_INLINE_PREFIX);
+        put_be32(wqe + MLX5_TX_DMA_DSEG_OFF + 0x00,
+                 (uint32_t)(frame_len - MLX5_TX_DMA_INLINE_PREFIX));
+        put_be32(wqe + MLX5_TX_DMA_DSEG_OFF + 0x04, mkey);
+        put_be64(wqe + MLX5_TX_DMA_DSEG_OFF + 0x08,
+                 tx_iova + MLX5_TX_DMA_DATA_OFFSET);
+    }
     put_be32(wqe + 0x00, ((pi & 0xffffu) << 8) | MLX5_OPCODE_SEND);
     put_be32(wqe + 0x04, ((sq->sqn & 0x00ffffffu) << 8) | ds);
     wqe[0x0b] = request_completion ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
     put_be32(wqe + 0x0c, tisn & 0x00ffffffu);
 
-    put_be16(wqe + 0x1c, (uint16_t)frame_len);
-    memcpy(wqe + 0x1e, frame, 2);
-    memcpy(wqe + 0x20, frame + 2, frame_len - 2);
+    if (frame_len <= MLX5_TX_TEST_MAX_INLINE_FRAME) {
+        put_be16(wqe + 0x1c, (uint16_t)frame_len);
+        memcpy(wqe + 0x1e, frame, 2);
+        memcpy(wqe + 0x20, frame + 2, frame_len - 2);
+    }
 
     sq->prod_index += wqebbs;
+    sq->wqebb_count[pi & (MLX5_SQ_WQE_COUNT - 1)] = (uint8_t)wqebbs;
     if (!g_mlx5_stdout_quiet) {
         printf("  prepare SEND WQE: sqn=%" PRIu32 " tisn=%" PRIu32
-               " inline_len=%zu pi=%" PRIu32 " new_pi=%" PRIu32
+               " %s_len=%zu pi=%" PRIu32 " new_pi=%" PRIu32
                " completion=%d\n",
-               sq->sqn, tisn, frame_len, pi, sq->prod_index,
+               sq->sqn, tisn,
+               frame_len <= MLX5_TX_TEST_MAX_INLINE_FRAME ? "inline" : "dma",
+               frame_len, pi, sq->prod_index,
                request_completion);
-        dump_hex("  send frame", frame, frame_len);
+        if (frame != NULL) {
+            dump_hex("  send frame", frame, frame_len);
+        }
         dump_hex("  send wqe", wqe, wqebbs << MLX5_SEND_WQE_BB_LOG);
     }
     *wqe_out = wqe;
@@ -2483,13 +2623,18 @@ static void mlx5_sq_reclaim_cqe(struct mlx5_sq_res *sq,
     uint32_t completed = (sq->cons_index & UINT32_C(0xffff0000)) |
                          (uint32_t)wqe_counter;
 
-    /* The CQE reports the first WQEBB of the completed WQE.  Each full-inline
-     * benchmark WQE consumes two WQEBBs.  Reconstruct its 32-bit generation
-     * from the 16-bit hardware counter and advance past that WQE. */
+    uint8_t wqebbs;
+
+    /* The CQE reports the first WQEBB of the completed WQE.  Reconstruct its
+     * 32-bit generation and advance by the WQE's recorded ring size. */
     if (completed < sq->cons_index) {
         completed += UINT32_C(0x10000);
     }
-    sq->cons_index = completed + 2;
+    wqebbs = sq->wqebb_count[completed & (MLX5_SQ_WQE_COUNT - 1)];
+    if (wqebbs == 0) {
+        wqebbs = 1;
+    }
+    sq->cons_index = completed + wqebbs;
 }
 
 static int mlx5_sq_poll_tx_cq(struct mlx5_cq_res *cq, struct mlx5_sq_res *sq,
@@ -2873,6 +3018,33 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
     if (rc != 0) {
         goto out;
     }
+    if (want_tx) {
+        uint16_t admin_mtu = 0;
+        uint16_t max_mtu = 0;
+        uint16_t oper_mtu = 0;
+
+        rc = mlx5_ctx_query_pmtu(&rt->ctx, 1, &admin_mtu, &max_mtu, &oper_mtu);
+        if (rc != 0) {
+            goto out;
+        }
+        if (max_mtu != 0 && MLX5_TX_TEST_PORT_MTU > max_mtu) {
+            fprintf(stderr, "requested TX port MTU %u exceeds port max_mtu %u\n",
+                    MLX5_TX_TEST_PORT_MTU, max_mtu);
+            rc = -1;
+            goto out;
+        }
+        if (admin_mtu != MLX5_TX_TEST_PORT_MTU) {
+            rc = mlx5_ctx_set_pmtu(&rt->ctx, 1, MLX5_TX_TEST_PORT_MTU);
+            if (rc != 0) {
+                goto out;
+            }
+            rc = mlx5_ctx_query_pmtu(&rt->ctx, 1, &admin_mtu, &max_mtu,
+                                     &oper_mtu);
+            if (rc != 0) {
+                goto out;
+            }
+        }
+    }
     if (want_rx) {
         rc = mlx5_ctx_enable_vport_promisc(&rt->ctx);
         if (rc != 0) {
@@ -2906,6 +3078,10 @@ int mlxnicd_dev_start(struct mlxnicd_dev *dev) {
         }
     }
     if (want_tx) {
+        rc = mlx5_ctx_set_vport_mtu(&rt->ctx, MLX5_TX_TEST_PORT_MTU);
+        if (rc != 0) {
+            goto out;
+        }
         rc = mlx5_ctx_create_tis(&rt->ctx, rt->tdn, rt->pd, &rt->tisn);
         if (rc != 0) {
             goto out;
@@ -3003,10 +3179,11 @@ uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
     }
 
     while (sent < nb_pkts) {
-        uint16_t batch = nb_pkts - sent;
+        uint16_t batch = 0;
         uint8_t *last_wqe = NULL;
         uint32_t used_wqebbs;
-        uint32_t available_pkts;
+        uint32_t available_wqebbs;
+        uint32_t batch_wqebbs = 0;
 
         /* A completion is requested only for the final WQE in each posted
          * burst.  Do not touch the CQ while the SQ still has room: polling it
@@ -3018,8 +3195,8 @@ uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
             dev->last_error = MLXNICD_ERR_IO;
             return sent;
         }
-        available_pkts = (MLX5_SQ_WQE_COUNT - used_wqebbs) / 2;
-        if (available_pkts == 0) {
+        available_wqebbs = MLX5_SQ_WQE_COUNT - used_wqebbs;
+        if (available_wqebbs == 0) {
             if (mlx5_sq_poll_tx_cq(&dev->rt.tx_cq[queue_id],
                                     &dev->rt.sq[queue_id], 1) <= 0) {
                 dev->last_error = MLXNICD_ERR_IO;
@@ -3028,9 +3205,23 @@ uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
             continue;
         }
 
-        /* Each supported full-inline frame consumes two of 256 SQ WQEBBs. */
-        if (batch > available_pkts) {
-            batch = (uint16_t)available_pkts;
+        /* Select as many packets as fit in the SQ.  Inline frames use two
+         * WQEBBs; a data-segment WQE uses one.  Treating all packets as
+         * two-WQEBB had needlessly split large-frame DMA floods. */
+        while ((uint16_t)(sent + batch) < nb_pkts) {
+            uint32_t packet_wqebbs =
+                pkts[sent + batch].len <= MLX5_TX_TEST_MAX_INLINE_FRAME ?
+                    2 : MLX5_TX_DMA_WQEBBS;
+
+            if (batch_wqebbs + packet_wqebbs > available_wqebbs) {
+                break;
+            }
+            batch_wqebbs += packet_wqebbs;
+            batch++;
+        }
+        if (batch == 0) {
+            dev->last_error = MLXNICD_ERR_IO;
+            return sent;
         }
         for (uint16_t i = 0; i < batch; i++) {
             int rc = mlx5_sq_prepare_send_raw(dev->rt.tisn, dev->rt.mkey,
@@ -3059,6 +3250,42 @@ uint16_t mlxnicd_tx_burst_q(struct mlxnicd_dev *dev, uint16_t queue_id,
 uint16_t mlxnicd_tx_burst(struct mlxnicd_dev *dev,
                           const struct mlxnicd_pkt *pkts, uint16_t nb_pkts) {
     return mlxnicd_tx_burst_q(dev, 0, pkts, nb_pkts);
+}
+
+int mlxnicd_tx_flood_prepare_q(struct mlxnicd_dev *dev, uint16_t queue_id,
+                               const struct mlxnicd_pkt *pkts,
+                               uint16_t nb_pkts) {
+    struct mlx5_sq_res *sq;
+
+    if (dev == NULL || pkts == NULL || nb_pkts == 0 || !dev->started ||
+        (dev->config.flags & MLXNICD_DEV_F_TX) == 0 ||
+        queue_id >= dev->rt.queue_count) {
+        return -1;
+    }
+    sq = &dev->rt.sq[queue_id];
+    for (uint32_t slot = 0; slot < MLX5_TX_DMA_SLOT_COUNT; slot++) {
+        const struct mlxnicd_pkt *pkt = &pkts[slot % nb_pkts];
+        uint8_t *dst = (uint8_t *)sq->tx_page.addr +
+                       (size_t)slot * MLX5_TX_DMA_SLOT_SIZE;
+
+        if (pkt->data == NULL ||
+            pkt->len <= MLX5_TX_TEST_MAX_INLINE_FRAME ||
+            pkt->len > MLX5_TX_TEST_MAX_FRAME) {
+            return -1;
+        }
+        if (slot != 0 && pkt->len != sq->flood_frame_len) {
+            return -1;
+        }
+        if (slot == 0) {
+            sq->flood_frame_len = pkt->len;
+        }
+        memcpy(dst, pkt->data, MLX5_TX_DMA_INLINE_PREFIX);
+        memcpy(dst + MLX5_TX_DMA_DATA_OFFSET,
+               pkt->data + MLX5_TX_DMA_INLINE_PREFIX,
+               pkt->len - MLX5_TX_DMA_INLINE_PREFIX);
+    }
+    sq->flood_prepared = 1;
+    return 0;
 }
 
 int mlxnicd_tx_flush_q(struct mlxnicd_dev *dev, uint16_t queue_id) {

@@ -1337,3 +1337,166 @@ The main lcore must be CPU 0 and workers CPU 1--8.  Do not use the older
 `-l 1,2,3,4,5,6,7,8,9` mapping: it places the main lcore and one worker on
 hyperthreads of the same physical core.  With that mapping and only 2,048 RX
 descriptors, a 98-byte 50M run lost 12,971 frames.
+
+## Current peer: sdn-svr7 (2026-07-15)
+
+`sdn-svr5` appears to have a board failure, so the peer cable has been moved
+to `sdn-svr7`.  Use `sdn-svr7:eth2` / `0000:01:00.1` as the DPDK RX-only peer
+for the line-rate campaign:
+
+```text
+sdn-svr7 eth2 MAC       ec:0d:9a:44:2d:15
+sdn-svr7 eth2 link      100000Mb/s, link detected yes
+sdn-svr7 PCIe link      16.0 GT/s x16
+sdn-svr6 source BDF     0000:01:00.0, vfio-pci, PCIe 16.0 GT/s x16
+```
+
+The verified peer command is:
+
+```sh
+ssh -F /home/sora/.ssh/config sdn-svr7 "setsid -f sh -c 'sudo dpdk-testpmd \
+  --file-prefix=svr7flood -l 0,1,2,3,4,5,6,7,8 -n 4 -a 0000:01:00.1 -- \
+  --nb-cores=8 --rxq=8 --txq=8 --rss-ip --rss-udp \
+  --forward-mode=rxonly --burst=128 --rxd=8192 --txd=2048 \
+  --mbuf-size=8192 --max-pkt-len=4096 \
+  --stats-period=1 --auto-start' >/tmp/testpmd-svr7-flood.log 2>&1"
+```
+
+`ssh` from the local development host must use `-F /home/sora/.ssh/config`,
+otherwise the system SSH config may stop on a bad systemd-generated file.
+
+Fresh validation after the cable move:
+
+```sh
+ssh -F /home/sora/.ssh/config sdn-svr6 'cd ~/work/takagi/nicd && \
+  sudo ./mlxnicd raw-flood --bdf 0000:01:00.0 --peer-if eth2 \
+  --src-mac 02:00:00:00:00:06 --dst-mac ff:ff:ff:ff:ff:ff \
+  --ethertype 0x0800 --rss-udp --frame-len 1514 --queues 8 --count 5000000'
+```
+
+Result:
+
+```text
+raw-flood: ok tx=5000000
+raw-flood: tx rate 6.272 Mpps 75.969 Gbps
+sdn-svr7 eth2 rx_packets_phy delta = 5,000,000
+sdn-svr7 eth2 rx_bytes_phy delta   = 7,590,000,000
+sdn-svr7 eth2 rx_discards_phy delta = 0
+```
+
+This proves the current bottleneck at that stage was not the cable, peer PCIe
+width, or peer RX loss for 1514-byte traffic.  The later jumbo result below is
+the current line-rate reference.
+
+### Jumbo status update
+
+The jumbo egress issue is partially resolved.  Vport MTU alone was not enough;
+the source port also needs `ACCESS_REG` `PMTU` (`MLX5_REG_PMTU = 0x5003`) with
+`admin_mtu=4096`.  The driver now queries/sets PMTU before setting the vport
+MTU.  With `sdn-svr7` running `testpmd --mbuf-size=8192 --max-pkt-len=4096`,
+the largest valid source frame is 4092 bytes; the peer physical byte counter
+then sees 4096 bytes per packet including FCS.
+
+Earlier valid jumbo result:
+
+```text
+raw-flood --frame-len 4092 --queues 8 --count 5000000
+source: 2.233 Mpps / 73.114 Gb/s
+peer:   rx_packets_phy +5,000,000
+        rx_bytes_phy   +20,480,000,000
+        rx_discards_phy +0
+```
+
+Invalid result to ignore: a 4092-byte source-only run once printed
+99.944 Gb/s when PMTU was accidentally set to 4092; peer counters did not
+increase for that run.  Treat TX CQ completion as insufficient evidence for
+wire throughput.
+
+Ineffective experiments:
+
+- 16-byte-aligning the SEND data segment did not improve valid throughput.
+- Increasing raw-flood burst size from 4096 to 8192 packets was slower.
+- Increasing queue count beyond two does not help 4092-byte frames
+  (`1/2/4/8 queues = 71.421/73.081/72.862/72.699 Gb/s`).
+- Increasing the source endpoint PCIe MaxReadReq from 512B to 4096B was
+  ineffective.  The measured value changed only from roughly 73.114 Gb/s to
+  73.241 Gb/s for a valid 4092-byte 5M-packet run.  The setting was reverted
+  to the original Device Control value `0x293f`.
+- Inlining the first 64 bytes of a jumbo SEND WQE was ineffective
+  (`73.067 Gb/s` valid 4092-byte run).  This was reverted to the normal
+  L2-only inline header.
+- Splitting the jumbo payload into two DMA data segments was ineffective
+  (`73.075 Gb/s` valid 4092-byte run).  This was reverted to the normal single
+  data segment.
+
+Current valid custom-driver line-rate result:
+
+```text
+raw-flood --frame-len 4092 --queues 8 --count 50000000
+source: 3.035 Mpps / 99.357 Gb/s
+peer:   rx_packets_phy +50,000,000
+        rx_bytes_phy   +204,800,000,000
+        rx_discards_phy +0
+```
+
+Reproduction command:
+
+```sh
+ssh -F /home/sora/.ssh/config sdn-svr6 'cd ~/work/takagi/nicd && \
+  sudo ./mlxnicd raw-flood --bdf 0000:01:00.0 --peer-if eth2 \
+  --src-mac 02:00:00:00:00:01 --dst-mac ec:0d:9a:44:2d:15 \
+  --ethertype 0x0800 --rss-udp --frame-len 4092 --queues 8 --count 50000000'
+```
+
+If the repository was synced from the local Nix environment, rebuild on
+`sdn-svr6` before running:
+
+```sh
+ssh -F /home/sora/.ssh/config sdn-svr6 'cd ~/work/takagi/nicd && make clean && make'
+```
+
+Otherwise `sudo ./mlxnicd` may fail with `unable to execute ./mlxnicd: No such
+file or directory` because the copied ELF interpreter points into `/nix/store`.
+
+The line-rate reproduction conditions are: `sdn-svr7` RX-only DPDK peer, peer
+unicast destination MAC `ec:0d:9a:44:2d:15`, IPv4 EtherType `0x0800`,
+`--rss-udp`, source PMTU/vport MTU 4096, 4092-byte Ethernet frames, and source
+port bound to `vfio-pci`.
+
+DPDK source baseline status: available if `txq_mem_algn=0` is used.  `sdn-svr6`
+has DPDK 25.11 and `0000:01:00.0` can be restored to `mlx5_core`.  The default
+mlx5 PMD settings fail before sending:
+
+```text
+mlx5_net: Failed to register unique umem for all SQs.
+mlx5_net: port 0 Tx queues memory allocation failed: Protocol not supported
+```
+
+Forcing `--iova-mode=pa` does not help, and the failure also happens with a
+1514-byte packet, so it is not jumbo-specific.  The working devarg is:
+
+```text
+-a 0000:01:00.0,txq_mem_algn=0
+```
+
+With that devarg, `testpmd txonly` starts.  A 1514-byte run reports about
+98.4 Gb/s.  A 4092-byte run using interactive `set txpkts 4092` produced this
+peer-counter baseline during a 6s command window:
+
+```text
+sdn-svr7 eth2 rx_packets_phy +16,936,864
+sdn-svr7 eth2 rx_bytes_phy   +69,373,394,944
+approx peer-counter rate     92.5 Gb/s
+```
+
+This DPDK baseline was useful while the custom driver still appeared capped at
+about 73 Gb/s.  It is no longer the best result: the custom driver now has a
+validated 99.357 Gb/s 4092-byte run under the reproduction conditions above.
+Keep the DPDK sequence only as a comparative fallback and sanity check.
+
+After DPDK attempts, always rebind the source port to `vfio-pci`; verify with:
+
+```sh
+ssh -F /home/sora/.ssh/config sdn-svr6 \
+  'readlink /sys/bus/pci/devices/0000:01:00.0/driver'
+```

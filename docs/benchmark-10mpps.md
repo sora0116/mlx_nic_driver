@@ -348,9 +348,205 @@ The implementation and this result were committed on the `benchmark` branch
 as `0caeda0` (`Benchmark PCIe effective throughput`).  `references/` remains
 local research material and is intentionally not part of that commit.
 
+## 100 GbE line-rate campaign with `sdn-svr7` (2026-07-15)
+
+`sdn-svr5` became unavailable because of an apparent board failure.  The cable
+from the custom-driver port on `sdn-svr6` (`0000:01:00.0`) was moved to
+`sdn-svr7:0000:01:00.1` (`eth2`, MAC `ec:0d:9a:44:2d:15`).  Both ports reported
+100 GbE link-up; the peer's active PCIe link is **Gen4 x16 (16.0 GT/s x16)**.
+This removes the old peer's Gen1 x16 DMA limit from the line-rate experiment.
+The peer uses DPDK 25.11 `testpmd` in RX-only mode:
+
+```sh
+ssh sdn-svr7 "setsid -f sh -c 'sudo dpdk-testpmd --file-prefix=svr7flood \\
+  -l 0,1,2,3,4,5,6,7,8 -n 4 -a 0000:01:00.1 -- \\
+  --nb-cores=8 --rxq=8 --txq=8 --rss-ip --rss-udp \\
+  --forward-mode=rxonly --burst=128 --rxd=8192 --txd=2048 \\
+  --mbuf-size=8192 --max-pkt-len=4096 \\
+  --stats-period=1 --auto-start' >/tmp/testpmd-svr7-flood.log 2>&1"
+```
+
+### Effective: Gen4 peer raises the 98-byte baseline
+
+With the existing full-inline TX WQE (maximum 98-byte Ethernet frame), eight
+source queues sent 100 million packets without a peer RX miss:
+
+```text
+raw-flood frame_len=98: 41.575 Mpps / 32.595 Gb/s
+sdn-svr7 testpmd: RX-packets=100000000, RX-missed=0
+```
+
+This is a useful control result: the previous 20.248 Gb/s ceiling was not a
+100 GbE-wire or source-CPU ceiling.  It was strongly constrained by the old
+Gen1 peer's PCIe receive path.  A 98-byte frame cannot itself reach 100 GbE
+payload throughput at 41.575 Mpps, so large-frame DMA TX is the required next
+step.
+
+### Path to DMA-backed jumbo SEND
+
+`raw-flood --frame-len N` now accepts frames up to 4092 bytes.  Frames at most
+98 bytes keep the established all-inline WQE.  Larger frames use a per-SQ DMA
+packet ring with 4096-byte slots, inline the mandatory 14-byte L2 header, and
+describe the remaining bytes in a data segment starting at a 16-byte-aligned DMA
+offset.  The MKey must permit both local write (RX) and local read (TX): the old
+value `0x18` enabled `rr|lw`, not `lr|lw`.  Changing it to `0x0c` fixed the
+local-read permission.
+
+The following attempts and outcomes must be retained when continuing this
+work:
+
+| Attempt | Result | Conclusion |
+| --- | --- | --- |
+| First data-segment WQE | CQE error `syndrome=0x53 vendor=0x04` | Local-protection failure; RX-only MKey permissions were insufficient. |
+| Set MKey start/length to full 64-bit range | `CREATE_MKEY` firmware status 3 | Invalid encoding for this PA-MKey form; reverted. |
+| Move TX IOVA from `0x30000000` to `0x0a000000` | Same local-protection CQE | IOVA placement was not the cause. |
+| Enable `lr|lw` (`mkc[0x02] = 0x0c`) | Frames are accepted/transmitted; no protection CQE | Correctly enables device DMA reads of TX buffers. |
+| Increase DMA ring from 4096 to 8192 slots | Still times out after source accepts 44,032--45,056 packets | Buffer reuse is not the remaining fault. |
+| Reclaim every DMA API burst | 100,000 packets complete, but 34.472 Gb/s (1 queue) | Confirms WQE correctness, but synchronous completion waits are too expensive. |
+| Account for real WQEBBs (DMA=1, inline=2) | 100,000 packets complete at 59.238 Gb/s (1 queue) | Fixes delayed-reclamation timeout and eliminates unnecessary SQ splitting. |
+| Prebuild 4,096 RSS-diverse frames per worker | 70.599 Gb/s (8 queues, 10M packets) | Removes timed packet-template copy/checksum work. |
+| Preload DMA packet rings and reuse them | **75.716 Gb/s** (8 queues, 10M packets) | Removes the driver-side 1514-byte copy; then-current best sustained result. |
+| Pin queue workers to CPUs 0--7 | 75.934 Gb/s (8 queues, 10M packets) | +0.3%, within run-to-run noise; CPU migration is not material. |
+| Re-test after moving the peer cable to `sdn-svr7` | 75.969 Gb/s (8 queues, 5M packets) | Confirms the `sdn-svr7` path is valid and consistent with the previous best. |
+| 4096-byte jumbo WQE, 8 queues | 98.992 Gb/s reported by source | **Not a valid line-rate result:** peer RX stayed 0. |
+| DPDK jumbo peer with 4096-byte mbufs | Port configuration fails | RX buffer needs room for 4092-byte packet plus 128-byte headroom. |
+| DPDK jumbo peer with 8192-byte mbufs | Starts successfully | Required peer configuration. |
+| Set custom-driver vport MTU to 4096 | Source reports 95.616 Gb/s; peer RX still 0 | Vport MTU alone did not make jumbo frames reach the wire. |
+| Set physical port PMTU (`ACCESS_REG PMTU=0x5003`) to 4096 | 1522B/2048B/4088B/4092B reach `sdn-svr7` | Effective for jumbo egress. Vport MTU alone was insufficient. |
+| Try 4096-byte Ethernet frame with peer `max-pkt-len=4096` | Source completes; peer RX stays unchanged | Ineffective/invalid. The peer accepts 4092-byte frames, which become 4096 bytes with FCS. |
+| 4092-byte frame, 8 queues, 5M packets | 2.233 Mpps / 73.114 Gb/s, peer receives all 5M with no discard | Valid jumbo result, but below line rate. |
+| 4092-byte queue scaling: 1/2/4/8 queues | 71.421 / 73.081 / 72.862 / 72.699 Gb/s | Ineffective beyond 2 queues. Queue count and CPU parallelism are not the present limiter. |
+| Move DMA payload from `tx_iova+14` to 16-byte-aligned `tx_iova+16` | Invalid source-only 99.944 Gb/s when PMTU was accidentally lowered to 4092; valid PMTU4096 rerun stayed 73.114 Gb/s | Ineffective. Peer counters are required; TX CQ completion alone can overstate throughput. |
+| Increase raw-flood burst from 4096 to 8192 packets | 4092B: 1 queue 68.045 Gb/s, 8 queues 72.238 Gb/s | Ineffective. Doorbell/CQE frequency is not the dominant limiter. Reverted to 4096. |
+| Try DPDK `testpmd txonly` on `sdn-svr6:0000:01:00.0` with default mlx5 PMD settings | Port fails to start: `Failed to register unique umem for all SQs` / `Tx queues memory allocation failed` | Ineffective. The default PMD TxQ memory alignment is incompatible with this host/driver combination. |
+| Force DPDK IOVA mode to PA | Same TX queue allocation failure | Ineffective for the DPDK baseline problem. |
+| Add mlx5 devarg `txq_mem_algn=0` | DPDK `txonly` starts. 1514B run reports about 98.4 Gb/s. | Effective. This disables/relaxes the problematic TxQ umem alignment path. |
+| DPDK `txonly`, `set txpkts 4092`, `txq_mem_algn=0` | Peer receives 16,936,864 packets / 69,373,394,944 bytes during the 6s command window; about 92.5 Gb/s by peer counters | Effective baseline. Same source port and peer path can exceed this driver's 73 Gb/s jumbo result. |
+| Increase source endpoint PCIe MaxReadReq from 512B to 4096B (`setpci CAP_EXP+8.w 0x293f -> 0x593f`) | 4092B valid run: 73.241 Gb/s, peer receives all 5M | Ineffective; DMA read request size is not the visible limiter. Reverted to 512B (`0x293f`). |
+| Inline first 64 bytes of jumbo frame, DMA-read the rest | 4092B valid run: 73.067 Gb/s, peer receives all 5M | Ineffective. Reducing host-memory DMA read by 50 bytes per packet does not move the 73 Gb/s ceiling. Reverted. |
+| Split jumbo payload into two DMA data segments | 4092B valid run: 73.075 Gb/s, peer receives all 5M | Ineffective. HCA DMA-read scheduling does not improve from two data segments. Reverted. |
+| Re-run on `sdn-svr7` after remote rebuild, unicast to peer MAC, IPv4/RSS, 4092B | 5M: 98.653 Gb/s; 50M: **99.357 Gb/s**, peer receives all packets, discard 0 | Effective. This is the current valid custom-driver line-rate result. |
+
+2026-07-15 re-check after physically moving the cable to `sdn-svr7`: the peer
+host still reports `eth2` as `0000:01:00.1`, link `100000Mb/s`, and PCIe
+`16.0 GT/s x16`.  A 5M-packet 1514-byte run completed at **6.272 Mpps /
+75.969 Gb/s**:
+
+```text
+raw-flood: ok tx=5000000
+raw-flood: tx rate 6.272 Mpps 75.969 Gbps
+sdn-svr7 eth2 counters: rx_packets_phy +5,000,000,
+                         rx_bytes_phy +7,590,000,000,
+                         rx_discards_phy +0
+```
+
+This validates the new peer path with hardware counters.  The received-byte
+delta is 1,518 bytes per packet, matching the 1,514-byte Ethernet frame plus
+FCS as counted by the NIC.
+
+Short runs that remain below the completion-timeout boundary do complete:
+
+| Source queues | Packets | Result | Rate |
+| ---: | ---: | --- | ---: |
+| 1 | 40,000 | complete | 4.436 Mpps / 53.734 Gb/s |
+| 8 | 320,000 (40,000 per queue) | complete | 5.094 Mpps / 61.696 Gb/s |
+
+At that stage, the initial eight-worker result improved the large-frame rate
+only 14.8%.  `sdn-svr6` has eight distinct online CPU cores (Intel i9-12900KS),
+and its source NIC is also at **Gen4 x16 (16.0 GT/s x16)**.  Removing packet
+construction and both timed full-frame copies raised the sustained rate from
+64.170 to 75.934 Gb/s, so memory/CPU work was material.  The later 4092-byte
+line-rate result shows that this was not a fundamental cable, peer PCIe, or
+source PCIe limit.
+
+### Jumbo-frame investigation
+
+The driver now constructs jumbo DMA-backed WQEs, makes them reach the wire, and
+has a validated line-rate run under the reproduction conditions below.  A
+source-only 4096-byte attempt once reported 98.992 Gb/s, but that older result
+is **not accepted as a line-rate result**:
+after resetting the `sdn-svr7` jumbo `testpmd` sink, its RX packet counter
+remained zero.  A successful TX CQE means the HCA consumed the WQE, not that
+the packet was emitted on the wire.
+
+The missing setting was the physical port MTU register, not only the NIC vport
+MTU.  Linux mlx5 uses `ACCESS_REG` with `MLX5_REG_PMTU = 0x5003`; the register
+contains `local_port`, `max_mtu`, `admin_mtu`, and `oper_mtu`.  Setting
+`admin_mtu` to 4096 and then setting the vport MTU to 4096 makes jumbo frames
+up to 4092 bytes reach `sdn-svr7`.  With peer `testpmd --max-pkt-len=4096`,
+a 4092-byte Ethernet frame is the practical maximum because the peer's physical
+byte counter includes the 4-byte FCS.
+
+Earlier valid jumbo run:
+
+```sh
+ssh sdn-svr6 'cd ~/work/takagi/nicd && sudo ./mlxnicd raw-flood \
+  --bdf 0000:01:00.0 --peer-if eth2 \
+  --src-mac 02:00:00:00:00:06 --dst-mac ff:ff:ff:ff:ff:ff \
+  --ethertype 0x0800 --rss-udp --frame-len 4092 --queues 8 --count 5000000'
+# raw-flood: tx rate 2.233 Mpps 73.114 Gbps
+# sdn-svr7 eth2 counters: rx_packets_phy +5,000,000,
+#                          rx_bytes_phy +20,480,000,000,
+#                          rx_discards_phy +0
+```
+
+Current valid jumbo line-rate run:
+
+```sh
+# If the tree was synced from a Nix-built local environment, rebuild on sdn-svr6.
+# Otherwise sudo may fail with "unable to execute ./mlxnicd: No such file or
+# directory" because the binary's ELF interpreter points into /nix/store.
+ssh -F /home/sora/.ssh/config sdn-svr6 'cd ~/work/takagi/nicd && make clean && make'
+
+ssh -F /home/sora/.ssh/config sdn-svr6 'cd ~/work/takagi/nicd && \
+  sudo ./mlxnicd raw-flood --bdf 0000:01:00.0 --peer-if eth2 \
+  --src-mac 02:00:00:00:00:01 --dst-mac ec:0d:9a:44:2d:15 \
+  --ethertype 0x0800 --rss-udp --frame-len 4092 --queues 8 --count 50000000'
+# raw-flood: tx rate 3.035 Mpps 99.357 Gbps
+# sdn-svr7 eth2 counters: rx_packets_phy +50,000,000,
+#                          rx_bytes_phy +204,800,000,000,
+#                          rx_discards_phy +0
+```
+
+This is the current accepted line-rate result for the custom driver.  It uses
+4092-byte Ethernet frames, which the peer counts as 4096 physical bytes per
+packet including FCS.  The source reports 99.357 Gb/s and the peer hardware
+counter confirms all 50 million packets with no discard.
+
+The earlier 73 Gb/s jumbo results should be retained as cautionary data, but
+they are no longer the current best.  The known effective reproduction
+conditions are: `sdn-svr7` RX-only DPDK peer, peer unicast destination MAC
+`ec:0d:9a:44:2d:15`, IPv4 EtherType `0x0800`, `--rss-udp`, source PMTU/vport MTU
+4096, and a binary rebuilt on `sdn-svr6`.
+
+The working DPDK baseline sequence is:
+
+```sh
+# Source: temporarily restore the source function to mlx5_core.
+ssh -F /home/sora/.ssh/config sdn-svr6 'cd ~/work/takagi/nicd && \
+  sudo ./mlxnicd vfio-restore 0000:01:00.0 && \
+  sudo ip link set eth1 mtu 4074 up'
+
+# Source: run txonly and set the generated packet length interactively.
+ssh -F /home/sora/.ssh/config sdn-svr6 'bash -lc '"'"'{
+  printf "set txpkts 4092\nstart\n";
+  sleep 6;
+  printf "show port stats all\nstop\nquit\n";
+} | sudo dpdk-testpmd --file-prefix=tx4092cmd -l 0,1 -n 4 \
+  -a 0000:01:00.0,txq_mem_algn=0 -- --nb-cores=1 --txq=1 --rxq=1 \
+  --forward-mode=txonly --mbuf-size=8192 --max-pkt-len=4096 \
+  --stats-period=1 -i'"'"''
+
+# Restore source for mlxnicd afterward.
+ssh -F /home/sora/.ssh/config sdn-svr6 'cd ~/work/takagi/nicd && \
+  sudo ./mlxnicd vfio-bind 0000:01:00.0'
+```
+
 ## Next work
 
-The 10 Mpps target is met.  Follow-on work should retain this benchmark as a
-regression test, add latency measurement that does not perturb the throughput
-path, and validate the same queue-local accounting against a custom-driver
-peer once `sdn-svr5` exposes usable IOMMU groups.
+The original 10 Mpps target and the later 100 GbE line-rate TX target are both
+met under the documented reproduction conditions.  Follow-on work should retain
+the 50M-packet 4092-byte run as a regression test, add latency measurement that
+does not perturb the throughput path, and extend the same level of validation
+to RX and custom-driver-to-custom-driver operation when a second VFIO-capable
+host is available.

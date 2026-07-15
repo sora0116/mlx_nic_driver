@@ -1,8 +1,13 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "sample.h"
 #include "mlxnicd.h"
 
 #include <inttypes.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -13,7 +18,8 @@
 #include <unistd.h>
 
 enum {
-    MLXNICD_SAMPLE_TX_FRAME_CAPACITY = 98,
+    MLXNICD_SAMPLE_TX_FRAME_CAPACITY = 1514,
+    MLXNICD_SAMPLE_FLOOD_FRAME_CAPACITY = 4096,
     MLXNICD_SAMPLE_RX_BUFFER_SIZE = 2048,
     MLXNICD_SAMPLE_RX_WAIT_COUNT = 20,
     MLXNICD_SAMPLE_BENCH_MAGIC = 0x4d4c5842,
@@ -89,6 +95,19 @@ static void sample_report_dev_error(const char *what, struct mlxnicd_dev *dev) {
     int err = mlxnicd_dev_last_error(dev);
 
     fprintf(stderr, "%s: %s (%d)\n", what, mlxnicd_strerror(err), err);
+}
+
+static void sample_pin_flood_worker(uint16_t queue_id) {
+    cpu_set_t set;
+    long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+
+    if (cpu_count <= 0 || queue_id >= (uint16_t)cpu_count ||
+        queue_id >= CPU_SETSIZE) {
+        return;
+    }
+    CPU_ZERO(&set);
+    CPU_SET(queue_id, &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
 static void sample_dump_hex(const char *label, const void *buf, size_t len) {
@@ -506,8 +525,10 @@ static int sample_raw_bench_parallel(struct mlxnicd_dev *dev,
 static void *sample_raw_flood_worker(void *arg) {
     struct sample_flood_worker *worker = arg;
     struct sample_flood_ctx *ctx = worker->ctx;
-    uint8_t (*frames)[MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+    uint8_t (*frames)[MLXNICD_SAMPLE_FLOOD_FRAME_CAPACITY];
     struct mlxnicd_pkt *tx;
+
+    sample_pin_flood_worker(worker->queue_id);
 
     /* Keep the large batching buffers off pthread's comparatively small
      * default stack.  The allocation is per queue and remains private to its
@@ -520,6 +541,31 @@ static void *sample_raw_flood_worker(void *arg) {
         atomic_store_explicit(&ctx->failed, 1, memory_order_relaxed);
         return NULL;
     }
+    /* raw-flood measures the TX datapath, not packet construction.  Build a
+     * worker-private, RSS-diverse set once and reuse it.  The 4,096 source
+     * ports are sufficient to spread traffic across the peer's queues while
+     * avoiding a 1514-byte template copy and IPv4 checksum per packet in the
+     * timed region. */
+    for (uint32_t i = 0; i < MLXNICD_SAMPLE_FLOOD_BURST; i++) {
+        sample_bench_build_from_template(
+            ctx->frame_opts, ctx->template_frame, ctx->frame_len,
+            worker->seq_begin + i, 0, 0, frames[i]);
+        tx[i].data = frames[i];
+        tx[i].len = ctx->frame_len;
+    }
+    if (ctx->frame_len > 98 &&
+        mlxnicd_tx_flood_prepare_q(ctx->dev, worker->queue_id, tx,
+                                   MLXNICD_SAMPLE_FLOOD_BURST) != 0) {
+        atomic_store_explicit(&ctx->failed, 1, memory_order_relaxed);
+        free(tx);
+        free(frames);
+        return NULL;
+    }
+    if (ctx->frame_len > 98) {
+        for (uint32_t i = 0; i < MLXNICD_SAMPLE_FLOOD_BURST; i++) {
+            tx[i].data = NULL;
+        }
+    }
 
     while (!atomic_load_explicit(&ctx->go, memory_order_acquire)) {
     }
@@ -529,13 +575,6 @@ static void *sample_raw_flood_worker(void *arg) {
 
         if (batch > MLXNICD_SAMPLE_FLOOD_BURST) {
             batch = MLXNICD_SAMPLE_FLOOD_BURST;
-        }
-        for (uint32_t i = 0; i < batch; i++) {
-            sample_bench_build_from_template(
-                ctx->frame_opts, ctx->template_frame, ctx->frame_len,
-                worker->seq_next + i, 0, 0, frames[i]);
-            tx[i].data = frames[i];
-            tx[i].len = ctx->frame_len;
         }
         if (mlxnicd_tx_burst_q(ctx->dev, worker->queue_id, tx,
                                (uint16_t)batch) != batch) {
@@ -560,7 +599,7 @@ int sample_raw_flood(const struct raw_flood_opts *opts) {
     struct sample_flood_ctx ctx = {0};
     struct sample_flood_worker workers[8] = {{0}};
     pthread_t threads[8];
-    uint8_t frame_template[MLXNICD_SAMPLE_TX_FRAME_CAPACITY];
+    uint8_t frame_template[MLXNICD_SAMPLE_FLOOD_FRAME_CAPACITY];
     uint32_t frame_len = 0;
     uint64_t start_ns;
     uint64_t end_ns;
@@ -578,6 +617,27 @@ int sample_raw_flood(const struct raw_flood_opts *opts) {
     if (sample_bench_build_frame(&frame_opts, 0, 0, 0, frame_template,
                                  sizeof(frame_template), &frame_len) != 0) {
         return -1;
+    }
+    if (opts->frame_len != 0) {
+        uint8_t *ip;
+        uint8_t *udp;
+
+        if (opts->frame_len < frame_len ||
+            opts->frame_len > MLXNICD_SAMPLE_FLOOD_FRAME_CAPACITY) {
+            fprintf(stderr, "--frame-len must be in the range %u..%u\n",
+                    frame_len, MLXNICD_SAMPLE_FLOOD_FRAME_CAPACITY);
+            return -1;
+        }
+        memset(frame_template + frame_len, 0, opts->frame_len - frame_len);
+        frame_len = opts->frame_len;
+        if (opts->rss_udp) {
+            ip = frame_template + 14;
+            udp = ip + 20;
+            sample_put_be16(ip + 2, (uint16_t)(frame_len - 14));
+            sample_put_be16(ip + 10, 0);
+            sample_put_be16(ip + 10, sample_ipv4_checksum(ip, 20));
+            sample_put_be16(udp + 4, (uint16_t)(frame_len - 14 - 20));
+        }
     }
 
     mlxnicd_dev_config_init(&config);

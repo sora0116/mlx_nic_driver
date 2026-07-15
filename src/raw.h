@@ -42,6 +42,7 @@ struct raw_flood_opts {
     const char *ethertype;
     const char *payload_hex;
     uint32_t packet_count;
+    uint32_t frame_len;
     uint16_t queue_count;
     int rss_udp;
     int verbose;
